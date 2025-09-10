@@ -34,7 +34,7 @@ int main() {
     
     // 打开 TAP 设备
     printf("[1] Opening TAP device...\n");
-    TapTunDevice* device = TapTun_Open();
+    TapTunDevice* device = TapTun_Open(NULL);
     
     unsigned char mac[6]; 
 

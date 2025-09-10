@@ -35,11 +35,15 @@ typedef struct {
 } TapTunDevice;
 
 /**
- * @brief Opens the first available TAP device.
+ * @brief Opens a TAP device.
+ * @param name The desired name of the network interface. 
+ *             On Windows, this will search for a TAP adapter with a matching connection name.
+ *             On Linux, this will attempt to create a TAP device with the specified name.
+ *             If NULL or empty, the function opens the first available device.
  * @return A pointer to a TapTunDevice structure on success, NULL on failure.
  *         The caller is responsible for freeing this structure using TapTun_Close.
  */
-TAPTUN_API TapTunDevice* TapTun_Open();
+TAPTUN_API TapTunDevice* TapTun_Open(const char* name);
 
 /**
  * @brief Retrieves the MAC address of the TAP device.

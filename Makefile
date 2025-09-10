@@ -79,7 +79,7 @@ test: $(TEST_EXE)
 
 $(TEST_EXE): $(TARGET_LIB)
 	@echo "==> Linking test executable for $(TARGET)..."
-	$(CC) $(TEST_SRC) -o $@ -I$(INCLUDE_DIR) -Lbin -ltuntap $(TEST_LDFLAGS_EXTRA)
+	$(CC) $(TEST_SRC) -o $@ -I$(INCLUDE_DIR) -Lbin -ltaptun $(TEST_LDFLAGS_EXTRA)
 	@echo "==> Successfully created $@"
 
 # --- 工具规则 ---

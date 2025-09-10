@@ -12,20 +12,24 @@
 #include "tap-windows6.h"
 
 
-TapTunDevice* TapTun_Open() {
+TapTunDevice* TapTun_Open(const char* name) {
     HKEY adapter_key;
     LONG status = RegOpenKeyExA(HKEY_LOCAL_MACHINE, ADAPTER_KEY, 0, KEY_READ, &adapter_key);
     if (status != ERROR_SUCCESS) return NULL;
 
     for (int i = 0; ; ++i) {
-        char enum_name[256], unit_key_name[512], component_id[256], guid_str[256], device_path[512];
-        HKEY unit_key, connection_key;
+        char enum_name[256], unit_key_name[512], component_id[256], guid_str[256];
+        HKEY unit_key;
         DWORD len = sizeof(enum_name);
 
-        if (RegEnumKeyExA(adapter_key, i, enum_name, &len, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
+        if (RegEnumKeyExA(adapter_key, i, enum_name, &len, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) {
+            break; // 没有更多适配器
+        }
         
         snprintf(unit_key_name, sizeof(unit_key_name), "%s\\%s", ADAPTER_KEY, enum_name);
-        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, unit_key_name, 0, KEY_READ, &unit_key) != ERROR_SUCCESS) continue;
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, unit_key_name, 0, KEY_READ, &unit_key) != ERROR_SUCCESS) {
+            continue;
+        }
 
         len = sizeof(component_id);
         if (RegQueryValueExA(unit_key, "ComponentId", NULL, NULL, (LPBYTE)component_id, &len) == ERROR_SUCCESS &&
@@ -37,30 +41,68 @@ TapTunDevice* TapTun_Open() {
                 continue;
             }
 
+            // 如果指定了名称，请检查是否匹配
+            if (name && name[0] != '\0') {
+                HKEY connection_key;
+                char connection_name[256];
+                char connection_key_name[512];
+                snprintf(connection_key_name, sizeof(connection_key_name), "%s\\%s\\Connection", NETWORK_CONNECTIONS_KEY, guid_str);
+                
+                if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, connection_key_name, 0, KEY_READ, &connection_key) == ERROR_SUCCESS) {
+                    len = sizeof(connection_name);
+                    // 只有成功读取到名称时才进行比较
+                    if (RegQueryValueExA(connection_key, "Name", NULL, NULL, (LPBYTE)connection_name, &len) == ERROR_SUCCESS) {
+                        if (strcmp(name, connection_name) != 0) {
+                            RegCloseKey(connection_key);
+                            RegCloseKey(unit_key);
+                            continue; // 不是我们正在寻找的适配器
+                        }
+                    } else { // 读取名称失败，无法确认，跳过
+                        RegCloseKey(connection_key);
+                        RegCloseKey(unit_key);
+                        continue;
+                    }
+                    RegCloseKey(connection_key);
+                } else {
+                    // 无法检查名称，因此我们不能确定它是正确的。跳过
+                    RegCloseKey(unit_key);
+                    continue;
+                }
+            }
+
+            // 找到了匹配的适配器（或者如果 name 为 NULL，则为任何 TAP 适配器），尝试打开它
+            char device_path[512];
             snprintf(device_path, sizeof(device_path), "%s%s%s", USERMODEDEVICEDIR, guid_str, TAP_WIN_SUFFIX);
-            HANDLE hDevice = CreateFileA(device_path, GENERIC_READ 
-                | GENERIC_WRITE, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_SYSTEM 
-                | FILE_FLAG_OVERLAPPED, 0);
-            // 必须使用 FILE_FLAG_OVERLAPPED 否则有严重性能问题
+            HANDLE hDevice = CreateFileA(device_path, GENERIC_READ | GENERIC_WRITE, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_SYSTEM | FILE_FLAG_OVERLAPPED, 0);
 
             if (hDevice != INVALID_HANDLE_VALUE) {
                 TapTunDevice* device = (TapTunDevice*)calloc(1, sizeof(TapTunDevice));
-                if (!device) { CloseHandle(hDevice); RegCloseKey(unit_key); continue; }
+                if (!device) {
+                    CloseHandle(hDevice);
+                    RegCloseKey(unit_key);
+                    continue; 
+                }
                 
                 device->handle = hDevice;
-                // 仅保存 GUID 和 Name 字符串，不进行转换
                 strncpy(device->guid_str, guid_str, sizeof(device->guid_str) - 1);
                 
                 device->overlap_read.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
                 device->overlap_write.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 
                 if (!device->overlap_read.hEvent || !device->overlap_write.hEvent) {
+                    if (device->overlap_read.hEvent) CloseHandle(device->overlap_read.hEvent);
+                    if (device->overlap_write.hEvent) CloseHandle(device->overlap_write.hEvent);
                     CloseHandle(hDevice);
                     free(device);
+                    RegCloseKey(unit_key);
+                    continue; // 无法创建事件，尝试下一个适配器
                 }
 
-                snprintf(unit_key_name, sizeof(unit_key_name), "%s\\%s\\Connection", NETWORK_CONNECTIONS_KEY, guid_str);
-                if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, unit_key_name, 0, KEY_READ, &connection_key) == ERROR_SUCCESS) {
+                // 获取接口名称并存储
+                HKEY connection_key;
+                char connection_key_name[512];
+                snprintf(connection_key_name, sizeof(connection_key_name), "%s\\%s\\Connection", NETWORK_CONNECTIONS_KEY, guid_str);
+                if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, connection_key_name, 0, KEY_READ, &connection_key) == ERROR_SUCCESS) {
                     len = sizeof(device->if_name);
                     RegQueryValueExA(connection_key, "Name", NULL, NULL, (LPBYTE)device->if_name, &len);
                     RegCloseKey(connection_key);
@@ -304,13 +346,18 @@ void TapTun_Close(TapTunDevice* device) {
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
-TapTunDevice* TapTun_Open() {
+TapTunDevice* TapTun_Open(const char* name) {
     struct ifreq ifr;
     int fd;
     if ((fd = open("/dev/net/tun", O_RDWR)) < 0) return NULL;
 
     memset(&ifr, 0, sizeof(ifr));
     ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
+
+    // 如果提供了名称，则使用它
+    if (name && name[0] != '\0') {
+        strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
+    }
 
     if (ioctl(fd, TUNSETIFF, (void*)&ifr) < 0) {
         close(fd);

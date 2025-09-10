@@ -73,7 +73,7 @@ int main(int argc, char* argv[]) {
 
     // 需要 root 权限
     printf("Initializing TAP device...\n");
-    TapTunDevice* tap = TapTun_Open();
+    TapTunDevice* tap = TapTun_Open(NULL);
     if (!tap) { printf("TapTun_Open failed.\n"); return 1; }
     if (TapTun_Activate(tap) != 0) { printf("TapTun_Activate failed.\n"); return 1; }
     if (TapTun_SetIPAddress(tap, local_ip, "255.255.255.0") != 0) {

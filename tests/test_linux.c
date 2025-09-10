@@ -38,7 +38,7 @@ int main() {
     printf("[INFO] This test must be run with root privileges (e.g., using 'sudo').\n\n");
 
     printf("[1] Opening TAP device...\n");
-    TapTunDevice* device = TapTun_Open();
+    TapTunDevice* device = TapTun_Open(NULL);
     
     unsigned char mac[6]; 
 
