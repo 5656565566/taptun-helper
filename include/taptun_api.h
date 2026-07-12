@@ -1,6 +1,10 @@
 #ifndef TAPTUN_API_H
 #define TAPTUN_API_H
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 #if defined(_WIN32)
     #include <winsock2.h>
     #include <windows.h>
@@ -27,6 +31,11 @@ typedef struct {
     char guid_str[256];
     OVERLAPPED overlap_read;
     OVERLAPPED overlap_write;
+    CRITICAL_SECTION io_lock;
+    CONDITION_VARIABLE io_condition;
+    int active_read;
+    int active_write;
+    int closing;
 #else
     intptr_t handle;
 #endif

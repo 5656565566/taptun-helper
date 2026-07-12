@@ -21,6 +21,7 @@ ifeq ($(TARGET), windows)
 	
 	TARGET_LIB = bin/taptun.dll
 	TARGET_IMPLIB = bin/libtaptun.dll.a
+	SRC = $(SRC_DIR)/taptun_win32.c
 	
 	LDFLAGS_EXTRA = -ladvapi32 -liphlpapi -lws2_32 -lole32
 
@@ -32,6 +33,7 @@ else ifeq ($(TARGET), linux)
 	CC = gcc
 
 	TARGET_LIB = bin/libtaptun.so
+	SRC = $(SRC_DIR)/taptun_linux.c
 
 	CFLAGS_EXTRA = -fPIC
 	LDFLAGS_EXTRA =
@@ -39,7 +41,8 @@ else ifeq ($(TARGET), linux)
 	TEST_EXE = bin/test_linux
 	TEST_SRC = tests/test_linux.c
 	TEST_LDFLAGS_EXTRA = -lpthread -Wl,-rpath,'$$ORIGIN'
-
+else
+    $(error Unsupported OS: $(DETECTED_OS))
 endif
 
 # --- 通用变量 ---
@@ -47,9 +50,7 @@ SRC_DIR = src
 INCLUDE_DIR = include
 BUILD_DIR = build
 
-SOURCES = $(wildcard $(SRC_DIR)/*.c)
-OBJECTS = $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(SOURCES))
-
+OBJECTS = $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(SRC))
 
 CFLAGS = -I$(INCLUDE_DIR) -Wall -g $(CFLAGS_EXTRA)
 LDFLAGS = -shared

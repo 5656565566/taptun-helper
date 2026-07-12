@@ -8,6 +8,19 @@ const char* TEST_MASK = "255.255.255.0";
 const char* TEST_IPV6 = "fd10::1";
 const int   TEST_IPV6_PREFIX = 64;
 
+int TestInvalidIPv4Input() {
+    TapTunDevice device;
+    memset(&device, 0, sizeof(device));
+    device.if_index = 1;
+
+    if (TapTun_SetIPAddress(&device, "invalid-ip", TEST_MASK) != -1 ||
+        TapTun_SetIPAddress(&device, TEST_IPV4, "invalid-mask") != -1) {
+        fprintf(stderr, "[ERROR] Invalid IPv4 input was not rejected.\n");
+        return -1;
+    }
+    return 0;
+}
+
 
 DWORD WINAPI PingThread(LPVOID lpParam) {
     const char* ip_address = (const char*)lpParam;
@@ -15,7 +28,7 @@ DWORD WINAPI PingThread(LPVOID lpParam) {
 
     printf("  [THREAD] Ping thread started. Pinging %s...\n", ip_address);
     
-    snprintf(command, sizeof(command), "ping %s -n 1", ip_address);
+    snprintf(command, sizeof(command), "ping %s -n 4", ip_address);
     
     // 使用 system() 执行命令。它会阻塞这个线程，直到 ping 完成
     int result = system(command);
@@ -31,6 +44,8 @@ DWORD WINAPI PingThread(LPVOID lpParam) {
 
 int main() {
     printf("--- TAP-Windows DLL Automated Functional Test ---\n");
+
+    if (TestInvalidIPv4Input() != 0) return 1;
     
     // 打开 TAP 设备
     printf("[1] Opening TAP device...\n");

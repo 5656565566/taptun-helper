@@ -5,8 +5,6 @@
 
 #include "../include/taptun_api.h"
 
-#pragma comment(lib, "ws2_32.lib") // 链接 Winsock 库
-
 // 用于在线程间传递数据的结构体
 typedef struct {
     TapTunDevice* tap_device;

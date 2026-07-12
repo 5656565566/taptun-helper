@@ -1,16 +1,9 @@
 #include "taptun_api.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-// windows
-#if defined(_WIN32)
+#include "tap-windows6.h"
 
 #include <ws2tcpip.h>
 #include <winioctl.h>
 #include <iphlpapi.h>
-#include "tap-windows6.h"
-
 
 TapTunDevice* TapTun_Open(const char* name) {
     HKEY adapter_key;
@@ -41,7 +34,7 @@ TapTunDevice* TapTun_Open(const char* name) {
                 continue;
             }
 
-            // 如果指定了名称，请检查是否匹配
+            // 如果指定了名称 请检查是否匹配
             if (name && name[0] != '\0') {
                 HKEY connection_key;
                 char connection_name[256];
@@ -57,20 +50,20 @@ TapTunDevice* TapTun_Open(const char* name) {
                             RegCloseKey(unit_key);
                             continue; // 不是我们正在寻找的适配器
                         }
-                    } else { // 读取名称失败，无法确认，跳过
+                    } else { // 读取名称失败 无法确认
                         RegCloseKey(connection_key);
                         RegCloseKey(unit_key);
                         continue;
                     }
                     RegCloseKey(connection_key);
                 } else {
-                    // 无法检查名称，因此我们不能确定它是正确的。跳过
+                    // 无法检查名称 因此不能确定它是正确的
                     RegCloseKey(unit_key);
                     continue;
                 }
             }
 
-            // 找到了匹配的适配器（或者如果 name 为 NULL，则为任何 TAP 适配器），尝试打开它
+            // 找到了匹配的适配器（或者如果 name 为 NULL 则为任何 TAP 适配器）尝试打开它
             char device_path[512];
             snprintf(device_path, sizeof(device_path), "%s%s%s", USERMODEDEVICEDIR, guid_str, TAP_WIN_SUFFIX);
             HANDLE hDevice = CreateFileA(device_path, GENERIC_READ | GENERIC_WRITE, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_SYSTEM | FILE_FLAG_OVERLAPPED, 0);
@@ -95,8 +88,11 @@ TapTunDevice* TapTun_Open(const char* name) {
                     CloseHandle(hDevice);
                     free(device);
                     RegCloseKey(unit_key);
-                    continue; // 无法创建事件，尝试下一个适配器
+                    continue; // 无法创建事件 尝试下一个适配器
                 }
+
+                InitializeCriticalSection(&device->io_lock);
+                InitializeConditionVariable(&device->io_condition);
 
                 // 获取接口名称并存储
                 HKEY connection_key;
@@ -126,12 +122,12 @@ int TapTun_GetMacAddress(TapTunDevice* device, unsigned char* mac_address) {
     }
 
     IP_ADAPTER_ADDRESSES* adapter_addresses = NULL;
-    // 初始缓冲区大小，可以设置得小一点
+    // 初始缓冲区大小 可以设置得小一点
     ULONG buffer_size = sizeof(IP_ADAPTER_ADDRESSES); 
     DWORD result = 0;
     int ret = -1;
     int attempts = 0;
-    const int MAX_ATTEMPTS = 3; // 设置最大重试次数，防止无限循环
+    const int MAX_ATTEMPTS = 3; // 设置最大重试次数 防止无限循环
 
     // 使用循环来处理缓冲区大小问题
     do {
@@ -218,31 +214,35 @@ int TapTun_Activate(TapTunDevice* device) {
 
 
 int TapTun_SetIPAddress(TapTunDevice* device, const char* ip, const char* mask) {
-    if (!device || device->if_index == 0) {
+    if (!device || device->if_index == 0 || !ip || !mask) {
         fprintf(stderr, "ERROR: SetIPAddress called on a device that is not properly activated or initialized.\n");
         return -1;
     }
+
+    IN_ADDR ip_addr, mask_addr;
+    // 在删除现有地址前验证全部输入，失败时不得改变接口状态
+    if (InetPtonA(AF_INET, ip, &ip_addr) != 1 || InetPtonA(AF_INET, mask, &mask_addr) != 1) {
+        fprintf(stderr, "ERROR: Invalid IPv4 address or subnet mask.\n");
+        return -1;
+    }
     
-    // Clean up existing addresses on the interface first
-    MIB_IPADDRTABLE* ipAddrTable = NULL;
-    DWORD tableSize = 0;
-    if (GetIpAddrTable(NULL, &tableSize, 0) == ERROR_INSUFFICIENT_BUFFER) {
-        ipAddrTable = (MIB_IPADDRTABLE*)malloc(tableSize);
-        if (ipAddrTable && GetIpAddrTable(ipAddrTable, &tableSize, 0) == NO_ERROR) {
-            for (DWORD i = 0; i < ipAddrTable->dwNumEntries; i++) {
-                if (ipAddrTable->table[i].dwIndex == device->if_index) {
-                    DeleteIPAddress(ipAddrTable->table[i].dwAddr);
+    PMIB_UNICASTIPADDRESS_TABLE address_table = NULL;
+    if (GetUnicastIpAddressTable(AF_INET, &address_table) == NO_ERROR) {
+        for (ULONG i = 0; i < address_table->NumEntries; ++i) {
+            MIB_UNICASTIPADDRESS_ROW* row = &address_table->Table[i];
+            if (row->InterfaceIndex == device->if_index) {
+                DWORD delete_result = DeleteUnicastIpAddressEntry(row);
+                if (delete_result != NO_ERROR && delete_result != ERROR_NOT_FOUND) {
+                    fprintf(stderr, "Failed to delete existing IPv4 address. Error: %lu\n", delete_result);
+                    FreeMibTable(address_table);
+                    return -1;
                 }
             }
         }
-        if (ipAddrTable) free(ipAddrTable);
+        FreeMibTable(address_table);
     }
     
     ULONG nteContext = 0, nteInstance = 0;
-    IN_ADDR ip_addr, mask_addr;
-    InetPton(AF_INET, ip, &ip_addr);
-    InetPton(AF_INET, mask, &mask_addr);
-
     DWORD result = AddIPAddress(ip_addr.S_un.S_addr, mask_addr.S_un.S_addr, device->if_index, &nteContext, &nteInstance);
     if (result != NO_ERROR) {
         fprintf(stderr, "Failed to add IPv4 address. Error: %lu\n", result);
@@ -280,260 +280,92 @@ int TapTun_SetIPAddressV6(TapTunDevice* device, const char* ipv6, int prefixLeng
 }
 
 int TapTun_Read(TapTunDevice* device, unsigned char* buffer, int bufferSize) {
-    if (!device) return -1;
+    if (!device || !buffer || bufferSize <= 0) return -1;
     DWORD bytesRead;
+    int result = -1;
 
+    EnterCriticalSection(&device->io_lock);
+    if (device->closing || device->active_read) {
+        LeaveCriticalSection(&device->io_lock);
+        return -1;
+    }
+    device->active_read = 1;
     ResetEvent(device->overlap_read.hEvent);
+    BOOL completed = ReadFile(device->handle, buffer, bufferSize, &bytesRead, &device->overlap_read);
+    DWORD lastError = completed ? ERROR_SUCCESS : GetLastError();
+    LeaveCriticalSection(&device->io_lock);
 
-    if (!ReadFile(device->handle, buffer, bufferSize, &bytesRead, &device->overlap_read)) {
-        DWORD lastError = GetLastError();
+    if (!completed) {
         if (lastError == ERROR_IO_PENDING) {
             if (GetOverlappedResult(device->handle, &device->overlap_read, &bytesRead, TRUE)) {
-                return (int)bytesRead;
-            } else {
-                return -1;
+                result = (int)bytesRead;
             }
-        } else {
-            return -1;
         }
+    } else {
+        // 如果 ReadFile 立即成功返回 TRUE bytesRead 已经包含了读取的字节数
+        result = (int)bytesRead;
     }
-    
-    // 如果 ReadFile 立即成功返回 TRUE，bytesRead 已经包含了读取的字节数
-    return (int)bytesRead;
+
+    EnterCriticalSection(&device->io_lock);
+    device->active_read = 0;
+    WakeAllConditionVariable(&device->io_condition);
+    LeaveCriticalSection(&device->io_lock);
+    return result;
 }
 
 int TapTun_Write(TapTunDevice* device, const unsigned char* data, int dataSize) {
-    if (!device) return -1;
+    if (!device || !data || dataSize <= 0) return -1;
     DWORD bytesWritten;
+    int result = -1;
 
+    EnterCriticalSection(&device->io_lock);
+    if (device->closing || device->active_write) {
+        LeaveCriticalSection(&device->io_lock);
+        return -1;
+    }
+    device->active_write = 1;
     ResetEvent(device->overlap_write.hEvent);
-    
-    if (!WriteFile(device->handle, data, dataSize, &bytesWritten, &device->overlap_write)) {
-        DWORD lastError = GetLastError();
+    BOOL completed = WriteFile(device->handle, data, dataSize, &bytesWritten, &device->overlap_write);
+    DWORD lastError = completed ? ERROR_SUCCESS : GetLastError();
+    LeaveCriticalSection(&device->io_lock);
+
+    if (!completed) {
         if (lastError == ERROR_IO_PENDING) {
             if (GetOverlappedResult(device->handle, &device->overlap_write, &bytesWritten, TRUE)) {
-                return (int)bytesWritten;
-            } else {
-                return -1;
+                result = (int)bytesWritten;
             }
-        } else {
-            return -1;
         }
+    } else {
+        result = (int)bytesWritten;
     }
 
-    return (int)bytesWritten;
+    EnterCriticalSection(&device->io_lock);
+    device->active_write = 0;
+    WakeAllConditionVariable(&device->io_condition);
+    LeaveCriticalSection(&device->io_lock);
+    return result;
 }
 
 void TapTun_Close(TapTunDevice* device) {
     if (device) {
+        EnterCriticalSection(&device->io_lock);
+        device->closing = 1;
+        LeaveCriticalSection(&device->io_lock);
+
+        // 先取消挂起操作，并等待所有 I/O 调用离开设备对象后再释放资源
+        CancelIoEx(device->handle, NULL);
+
+        EnterCriticalSection(&device->io_lock);
+        while (device->active_read || device->active_write) {
+            SleepConditionVariableCS(&device->io_condition, &device->io_lock, INFINITE);
+        }
+        LeaveCriticalSection(&device->io_lock);
+
         if (device->overlap_read.hEvent) CloseHandle(device->overlap_read.hEvent);
         if (device->overlap_write.hEvent) CloseHandle(device->overlap_write.hEvent);
         
         CloseHandle(device->handle);
+        DeleteCriticalSection(&device->io_lock);
         free(device);
     }
 }
-
-// Linux
-#elif defined(__linux__)
-
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <linux/if.h>
-#include <linux/if_tun.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-
-TapTunDevice* TapTun_Open(const char* name) {
-    struct ifreq ifr;
-    int fd;
-    if ((fd = open("/dev/net/tun", O_RDWR)) < 0) return NULL;
-
-    memset(&ifr, 0, sizeof(ifr));
-    ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
-
-    // 如果提供了名称，则使用它
-    if (name && name[0] != '\0') {
-        strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
-    }
-
-    if (ioctl(fd, TUNSETIFF, (void*)&ifr) < 0) {
-        close(fd);
-        return NULL;
-    }
-
-    TapTunDevice* device = (TapTunDevice*)calloc(1, sizeof(TapTunDevice));
-    if (!device) { close(fd); return NULL; }
-
-    device->handle = (intptr_t)fd;
-    strncpy(device->if_name, ifr.ifr_name, sizeof(device->if_name) - 1);
-    
-    // On Linux, if_index can be retrieved via ioctl
-    struct ifreq ifr_idx;
-    memset(&ifr_idx, 0, sizeof(ifr_idx));
-    strncpy(ifr_idx.ifr_name, device->if_name, IFNAMSIZ -1);
-    // Need a socket to perform this ioctl
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock >= 0) {
-        if (ioctl(sock, SIOCGIFINDEX, &ifr_idx) == 0) {
-            device->if_index = ifr_idx.ifr_ifindex;
-        }
-        close(sock);
-    }
-    
-    return device;
-}
-
-int TapTun_GetMacAddress(TapTunDevice* device, unsigned char* mac_address) {
-    if (!device || !mac_address) return -1;
-
-    struct ifreq ifr;
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        perror("socket failed");
-        return -1;
-    }
-
-    memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, device->if_name, IFNAMSIZ - 1);
-
-    if (ioctl(sock, SIOCGIFHWADDR, &ifr) < 0) {
-        perror("ioctl(SIOCGIFHWADDR) failed");
-        close(sock);
-        return -1;
-    }
-
-    close(sock);
-    memcpy(mac_address, ifr.ifr_hwaddr.sa_data, 6);
-    return 0;
-}
-
-int TapTun_Activate(TapTunDevice* device) {
-    if (!device) return -1;
-
-    struct ifreq ifr;
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) return -1;
-
-    // 复制接口名称到 ifreq 结构体
-    strncpy(ifr.ifr_name, device->if_name, IFNAMSIZ);
-
-    // 获取当前的接口标志 (flags)
-    if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) {
-        perror("ioctl(SIOCGIFFLAGS) failed");
-        close(sock);
-        return -1;
-    }
-
-    // 添加 IFF_UP 标志来激活接口
-    ifr.ifr_flags |= IFF_UP;
-
-    // 设置新的接口标志
-    if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0) {
-        perror("ioctl(SIOCSIFFLAGS) failed");
-        close(sock);
-        return -1;
-    }
-
-    close(sock);
-    return 0;
-}
-
-
-int TapTun_SetIPAddress(TapTunDevice* device, const char* ip, const char* mask) {
-    if (!device) return -1;
-
-    struct ifreq ifr;
-    struct sockaddr_in* addr_in;
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) return -1;
-
-    strncpy(ifr.ifr_name, device->if_name, IFNAMSIZ);
-
-    addr_in = (struct sockaddr_in*)&ifr.ifr_addr;
-    addr_in->sin_family = AF_INET;
-    if (inet_pton(AF_INET, ip, &addr_in->sin_addr) <= 0) {
-        perror("inet_pton(ip) failed");
-        close(sock);
-        return -1;
-    }
-    if (ioctl(sock, SIOCSIFADDR, &ifr) < 0) {
-        perror("ioctl(SIOCSIFADDR) failed for IP");
-        close(sock);
-        return -1;
-    }
-
-    addr_in = (struct sockaddr_in*)&ifr.ifr_netmask;
-    addr_in->sin_family = AF_INET;
-    if (inet_pton(AF_INET, mask, &addr_in->sin_addr) <= 0) {
-        perror("inet_pton(mask) failed");
-        close(sock);
-        return -1;
-    }
-    if (ioctl(sock, SIOCSIFNETMASK, &ifr) < 0) {
-        perror("ioctl(SIOCSIFNETMASK) failed for mask");
-        close(sock);
-        return -1;
-    }
-
-    close(sock);
-    return 0;
-}
-
-
-int TapTun_SetIPAddressV6(TapTunDevice* device, const char* ipv6, int prefixLength) {
-    if (!device) return -1;
-
-    struct in6_ifreq {
-        struct in6_addr ifr6_addr;
-        uint32_t        ifr6_prefixlen;
-        unsigned int    ifr6_ifindex;
-    };
-
-    struct in6_ifreq ifr6;
-    int sock = socket(AF_INET6, SOCK_DGRAM, 0);
-    if (sock < 0) return -1;
-
-    // 填充 in6_ifreq 结构体
-    memset(&ifr6, 0, sizeof(ifr6));
-    ifr6.ifr6_ifindex = device->if_index;
-    ifr6.ifr6_prefixlen = prefixLength;
-    if (inet_pton(AF_INET6, ipv6, &ifr6.ifr6_addr) <= 0) {
-        perror("inet_pton(ipv6) failed");
-        close(sock);
-        return -1;
-    }
-
-    // 使用 ioctl 添加 IPv6 地址
-    // SIOCSIFADDR 是一个通用命令，内核会根据 socket 的 family (AF_INET6)
-    // 和传入的结构体来决定是设置 v4 还是 v6 地址。
-    if (ioctl(sock, SIOCSIFADDR, &ifr6) < 0) {
-        perror("ioctl(SIOCSIFADDR) failed for IPv6");
-        close(sock);
-        return -1;
-    }
-
-    close(sock);
-    return 0;
-}
-
-int TapTun_Read(TapTunDevice* device, unsigned char* buffer, int bufferSize) {
-    if (!device) return -1;
-    return read((int)device->handle, buffer, bufferSize);
-}
-
-int TapTun_Write(TapTunDevice* device, const unsigned char* data, int dataSize) {
-    if (!device) return -1;
-    return write((int)device->handle, data, dataSize);
-}
-
-void TapTun_Close(TapTunDevice* device) {
-    if (device) {
-        close((int)device->handle);
-        free(device);
-    }
-}
-
-#endif

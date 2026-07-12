@@ -13,6 +13,18 @@ const char* TEST_MASK = "255.255.255.0";
 const char* TEST_IPV6 = "fd10::1";
 const int   TEST_IPV6_PREFIX = 64;
 
+int TestInvalidIPv4Input() {
+    TapTunDevice device;
+    memset(&device, 0, sizeof(device));
+
+    if (TapTun_SetIPAddress(&device, "invalid-ip", TEST_MASK) != -1 ||
+        TapTun_SetIPAddress(&device, TEST_IPV4, "invalid-mask") != -1) {
+        fprintf(stderr, "[ERROR] Invalid IPv4 input was not rejected.\n");
+        return -1;
+    }
+    return 0;
+}
+
 
 void* PingThread(void* arg) {
     const char* ip_address = (const char*)arg;
@@ -20,7 +32,7 @@ void* PingThread(void* arg) {
 
     printf("  [THREAD] Ping thread started. Pinging %s...\n", ip_address);
     
-    snprintf(command, sizeof(command), "ping -c 1 %s", ip_address);
+    snprintf(command, sizeof(command), "ping -c 4 %s", ip_address);
     
     int result = system(command);
     
@@ -36,6 +48,8 @@ void* PingThread(void* arg) {
 int main() {
     printf("--- TAP-Linux DLL Automated Functional Test ---\n");
     printf("[INFO] This test must be run with root privileges (e.g., using 'sudo').\n\n");
+
+    if (TestInvalidIPv4Input() != 0) return 1;
 
     printf("[1] Opening TAP device...\n");
     TapTunDevice* device = TapTun_Open(NULL);
@@ -89,7 +103,7 @@ int main() {
         return 1;
     }
     
-    // 主线程在这里阻塞，等待 TAP 设备接收到数据，其实更有可能收到 ARP 数据包
+    // 主线程在这里阻塞 等待 TAP 设备接收到数据 其实更有可能收到 ARP 数据包
     unsigned char buffer[2048];
     int bytesRead = TapTun_Read(device, buffer, sizeof(buffer));
 
