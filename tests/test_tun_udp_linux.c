@@ -10,7 +10,7 @@
 #include "../include/taptun_api.h"
 
 typedef struct {
-    TapTunDevice* tap_device;
+    TapTunDevice* tun_device;
     int udp_socket_fd;
     struct sockaddr_in remote_addr;
 } ThreadArgs;
@@ -19,15 +19,15 @@ void* tap_to_udp_thread(void* arg) {
     ThreadArgs* args = (ThreadArgs*)arg;
     unsigned char buffer[4096];
     int bytes_read;
-    printf("[THREAD Tap->UDP] Started.\n");
+    printf("[THREAD TUN->UDP] Started.\n");
 
     while (1) {
-        bytes_read = TapTun_Read(args->tap_device, buffer, sizeof(buffer));
+        bytes_read = TapTun_Read(args->tun_device, buffer, sizeof(buffer));
         if (bytes_read > 0) {
             sendto(args->udp_socket_fd, buffer, bytes_read, 0,
                    (struct sockaddr*)&args->remote_addr, sizeof(args->remote_addr));
         } else {
-            perror("[THREAD Tap->UDP] TapTun_Read failed");
+            perror("[THREAD TUN->UDP] TapTun_Read failed");
             break;
         }
     }
@@ -38,14 +38,14 @@ void* udp_to_tap_thread(void* arg) {
     ThreadArgs* args = (ThreadArgs*)arg;
     unsigned char buffer[4096];
     int bytes_received;
-    printf("[THREAD UDP->TAP] Started.\n");
+    printf("[THREAD UDP->TUN] Started.\n");
 
     while (1) {
         bytes_received = recvfrom(args->udp_socket_fd, buffer, sizeof(buffer), 0, NULL, NULL);
         if (bytes_received > 0) {
-            TapTun_Write(args->tap_device, buffer, bytes_received);
+            TapTun_Write(args->tun_device, buffer, bytes_received);
         } else {
-            perror("[THREAD UDP->TAP] recvfrom failed");
+            perror("[THREAD UDP->TUN] recvfrom failed");
             break;
         }
     }
@@ -72,15 +72,15 @@ int main(int argc, char* argv[]) {
     }
 
     // 需要 root 权限
-    printf("Initializing TAP device...\n");
-    TapTunDevice* tap = TapTun_Open(NULL);
-    if (!tap) { printf("TapTun_Open failed.\n"); return 1; }
-    if (TapTun_Activate(tap) != 0) { printf("TapTun_Activate failed.\n"); return 1; }
-    if (TapTun_SetIPAddress(tap, local_ip, "255.255.255.0") != 0) {
-        printf("TapTun_SetIPAddress failed.\n");
+    printf("Initializing TUN device...\n");
+    TapTunDevice* tun = TapTun_Open(NULL);
+    if (!tun) { printf("TapTun_Open failed.\n"); return 1; }
+    if (TapTun_Activate(tun) != 0) { printf("TapTun_Activate failed.\n"); return 1; }
+    if (TapTun_SetIPAddressV4(tun, local_ip, 24) != 0) {
+        printf("TapTun_SetIPAddressV4 failed.\n");
         return 1;
     }
-    printf("TAP device '%s' configured with IP %s\n", tap->if_name, local_ip);
+    printf("TUN device '%s' configured with IP %s\n", TapTun_GetName(tun), local_ip);
 
     int udp_sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_sock_fd < 0) { perror("socket() failed"); return 1; }
@@ -105,7 +105,7 @@ int main(int argc, char* argv[]) {
     remote_addr.sin_port = htons(atoi(remote_port_str));
     inet_pton(AF_INET, remote_ip_str, &remote_addr.sin_addr);
 
-    ThreadArgs args = { tap, udp_sock_fd, remote_addr };
+    ThreadArgs args = { tun, udp_sock_fd, remote_addr };
     pthread_t tid1, tid2;
     pthread_create(&tid1, NULL, tap_to_udp_thread, &args);
     pthread_create(&tid2, NULL, udp_to_tap_thread, &args);
@@ -119,7 +119,7 @@ int main(int argc, char* argv[]) {
     pthread_join(tid1, NULL);
     pthread_join(tid2, NULL);
     close(udp_sock_fd);
-    TapTun_Close(tap);
+    TapTun_Close(tun);
 
     return 0;
 }

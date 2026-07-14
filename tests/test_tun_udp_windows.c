@@ -7,47 +7,47 @@
 
 // 用于在线程间传递数据的结构体
 typedef struct {
-    TapTunDevice* tap_device;
+    TapTunDevice* tun_device;
     SOCKET udp_socket;
     struct sockaddr_in remote_addr;
 } ThreadArgs;
 
-// 从 TAP 读取并发送到 UDP
+// 从 TUN 读取并发送到 UDP
 DWORD WINAPI TapToUdpThread(LPVOID lpParam) {
     ThreadArgs* args = (ThreadArgs*)lpParam;
     unsigned char buffer[4096];
     int bytes_read;
-    printf("[THREAD Tap->UDP] Started.\n");
+    printf("[THREAD TUN->UDP] Started.\n");
 
     while (1) { // 简单起见，使用无限循环
-        bytes_read = TapTun_Read(args->tap_device, buffer, sizeof(buffer));
+        bytes_read = TapTun_Read(args->tun_device, buffer, sizeof(buffer));
         if (bytes_read > 0) {
             sendto(args->udp_socket, (const char*)buffer, bytes_read, 0, 
                    (struct sockaddr*)&args->remote_addr, sizeof(args->remote_addr));
         } else {
-            fprintf(stderr, "[THREAD Tap->UDP] TapTun_Read failed.\n");
+            fprintf(stderr, "[THREAD TUN->UDP] TapTun_Read failed.\n");
             break;
         }
     }
     return 0;
 }
 
-// 线程 2: 从 UDP 接收并写入 TAP
+// 线程 2: 从 UDP 接收并写入 TUN
 DWORD WINAPI UdpToTapThread(LPVOID lpParam) {
     ThreadArgs* args = (ThreadArgs*)lpParam;
     unsigned char buffer[4096];
     int bytes_received;
     struct sockaddr_in sender_addr;
     int sender_addr_len = sizeof(sender_addr);
-    printf("[THREAD UDP->TAP] Started.\n");
+    printf("[THREAD UDP->TUN] Started.\n");
 
     while (1) {
         bytes_received = recvfrom(args->udp_socket, (char*)buffer, sizeof(buffer), 0,
                                   (struct sockaddr*)&sender_addr, &sender_addr_len);
         if (bytes_received > 0) {
-            TapTun_Write(args->tap_device, buffer, bytes_received);
+            TapTun_Write(args->tun_device, buffer, bytes_received);
         } else {
-            fprintf(stderr, "[THREAD UDP->TAP] recvfrom failed with error: %d\n", WSAGetLastError());
+            fprintf(stderr, "[THREAD UDP->TUN] recvfrom failed with error: %d\n", WSAGetLastError());
             break;
         }
     }
@@ -80,15 +80,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    printf("Initializing TAP device...\n");
-    TapTunDevice* tap = TapTun_Open(NULL);
-    if (!tap) { printf("TapTun_Open failed.\n"); return 1; }
-    if (TapTun_Activate(tap) != 0) { printf("TapTun_Activate failed.\n"); return 1; }
-    if (TapTun_SetIPAddress(tap, local_ip, "255.255.255.0") != 0) {
-        printf("TapTun_SetIPAddress failed. Run as Administrator.\n");
+    printf("Initializing TUN device...\n");
+    TapTunDevice* tun = TapTun_Open(NULL);
+    if (!tun) { printf("TapTun_Open failed.\n"); return 1; }
+    if (TapTun_Activate(tun) != 0) { printf("TapTun_Activate failed.\n"); return 1; }
+    if (TapTun_SetIPAddressV4(tun, local_ip, 24) != 0) {
+        printf("TapTun_SetIPAddressV4 failed. Run as Administrator.\n");
         return 1;
     }
-    printf("TAP device configured with IP %s\n", local_ip);
+    printf("TUN device configured with IP %s\n", local_ip);
 
     SOCKET udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (udp_sock == INVALID_SOCKET) {
@@ -118,7 +118,7 @@ int main(int argc, char* argv[]) {
     remote_addr.sin_port = htons(atoi(remote_port_str));
     inet_pton(AF_INET, remote_ip_str, &remote_addr.sin_addr);
 
-    ThreadArgs args = { tap, udp_sock, remote_addr };
+    ThreadArgs args = { tun, udp_sock, remote_addr };
     HANDLE hTapToUdp = CreateThread(NULL, 0, TapToUdpThread, &args, 0, NULL);
     HANDLE hUdpToTap = CreateThread(NULL, 0, UdpToTapThread, &args, 0, NULL);
 
@@ -131,7 +131,7 @@ int main(int argc, char* argv[]) {
     CloseHandle(hTapToUdp);
     CloseHandle(hUdpToTap);
     closesocket(udp_sock);
-    TapTun_Close(tap);
+    TapTun_Close(tun);
     WSACleanup();
 
     return 0;

@@ -1,3 +1,5 @@
 /.vscode
 /bin
 /build
+/dev
+**/wintun.dll

@@ -1,136 +1,257 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <wchar.h>
+#include <windows.h>
 
 #include "../include/taptun_api.h"
 
-// 测试参数
-const char* TEST_IPV4 = "10.10.0.1";
-const char* TEST_MASK = "255.255.255.0";
-const char* TEST_IPV6 = "fd10::1";
-const int   TEST_IPV6_PREFIX = 64;
+typedef struct {
+    int closed;
+    int write_size;
+} CallbackContext;
 
-int TestInvalidIPv4Input() {
-    TapTunDevice device;
-    memset(&device, 0, sizeof(device));
-    device.if_index = 1;
-
-    if (TapTun_SetIPAddress(&device, "invalid-ip", TEST_MASK) != -1 ||
-        TapTun_SetIPAddress(&device, TEST_IPV4, "invalid-mask") != -1) {
-        fprintf(stderr, "[ERROR] Invalid IPv4 input was not rejected.\n");
-        return -1;
-    }
-    return 0;
+static int callback_read(void* context, unsigned char* buffer, int buffer_size) {
+    (void)context;
+    if (buffer_size < 4) return TAPTUN_ERROR_BUFFER_TOO_SMALL;
+    const unsigned char packet[] = { 0x45, 0x00, 0x00, 0x14 };
+    memcpy(buffer, packet, sizeof(packet));
+    return sizeof(packet);
 }
 
-
-DWORD WINAPI PingThread(LPVOID lpParam) {
-    const char* ip_address = (const char*)lpParam;
-    char command[128];
-
-    printf("  [THREAD] Ping thread started. Pinging %s...\n", ip_address);
-    
-    snprintf(command, sizeof(command), "ping %s -n 4", ip_address);
-    
-    // 使用 system() 执行命令。它会阻塞这个线程，直到 ping 完成
-    int result = system(command);
-    
-    if (result == 0) {
-        printf("  [THREAD] Ping command finished successfully.\n");
-    } else {
-        fprintf(stderr, "  [THREAD] Ping command failed with exit code %d.\n", result);
-    }
-    
-    return (DWORD)result;
+static int callback_write(void* context, const unsigned char* data, int data_size) {
+    (void)data;
+    ((CallbackContext*)context)->write_size = data_size;
+    return data_size;
 }
 
-int main() {
-    printf("--- TAP-Windows DLL Automated Functional Test ---\n");
+static void callback_close(void* context) {
+    ((CallbackContext*)context)->closed = 1;
+}
 
-    if (TestInvalidIPv4Input() != 0) return 1;
-    
-    // 打开 TAP 设备
-    printf("[1] Opening TAP device...\n");
-    TapTunDevice* device = TapTun_Open(NULL);
-    
-    unsigned char mac[6]; 
+static int test_unsupported_zero_copy(TapTunDevice* device) {
+    TapTunPacket packet;
+    memset(&packet, 0, sizeof(packet));
+    if (TapTun_GetCapabilities(device) != 0 || TapTun_GetQueueCount(device) != 1) return 1;
+    if (TapTun_AcquireReceive(device, &packet) != TAPTUN_ERROR_UNSUPPORTED) return 1;
+    if (TapTun_ReleaseReceive(device, &packet) != TAPTUN_ERROR_UNSUPPORTED) return 1;
+    if (TapTun_AcquireSend(device, 20, &packet) != TAPTUN_ERROR_UNSUPPORTED) return 1;
+    return TapTun_CommitSend(device, &packet) == TAPTUN_ERROR_UNSUPPORTED ? 0 : 1;
+}
 
-    if (device == NULL) {
-        fprintf(stderr, "  [ERROR] Failed to open TAP device. Is tap-windows6 installed and enabled?\n");
+static int test_wintun_zero_copy_send(TapTunDevice* device) {
+    uint32_t capabilities = TapTun_GetCapabilities(device);
+    if ((capabilities & (TAPTUN_CAP_ZERO_COPY_RECEIVE | TAPTUN_CAP_ZERO_COPY_SEND)) !=
+        (TAPTUN_CAP_ZERO_COPY_RECEIVE | TAPTUN_CAP_ZERO_COPY_SEND)) {
         return 1;
     }
-    printf("  [SUCCESS] Device opened successfully.\n");
-    printf("  [INFO] Handle: %p, Index: %u, Name: \"%s\"\n", device->handle, device->if_index, device->if_name);
 
-    // 激活设备
-    printf("\n[2] Activating device...\n");
-    if (TapTun_Activate(device) != 0) {
-        fprintf(stderr, "  [ERROR] Failed to activate device.\n");
-        TapTun_Close(device);
+    TapTunPacket packet;
+    memset(&packet, 0, sizeof(packet));
+    if (TapTun_AcquireSend(device, 20, &packet) != TAPTUN_OK || !packet.data || packet.size != 20) {
         return 1;
     }
-    printf("  [SUCCESS] Device activated.\n");
-    
-    if (TapTun_GetMacAddress(device, mac) == 0) {
-        printf("[INFO] MacAddress: %02x:%02x:%02x:%02x:%02x:%02x\n",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    } else {
-        printf("[ERROR] Failed to get MAC address.\n");
-    }
-
-    Sleep(3000); // 不等会导致 ip 未成功分配
-
-    // 测试程序必须以管理员权限运行!
-    printf("\n[3] Configuring IP addresses (requires Administrator privileges)...\n");
-    if (TapTun_SetIPAddress(device, TEST_IPV4, TEST_MASK) != 0) {
-        fprintf(stderr, "  [ERROR] Failed to set IPv4 address. Did you run this as Administrator?\n");
-    } else {
-        printf("  [SUCCESS] IPv4 address set to %s\n", TEST_IPV4);
-    }
-    
-    if (TapTun_SetIPAddressV6(device, TEST_IPV6, TEST_IPV6_PREFIX) != 0) {
-        fprintf(stderr, "  [ERROR] Failed to set IPv6 address.\n");
-    } else {
-        printf("  [SUCCESS] IPv6 address set to %s/%d\n", TEST_IPV6, TEST_IPV6_PREFIX);
-    }
-
-    printf("\n[4] Starting background ping thread and waiting for packet...\n");
-    HANDLE hPingThread = CreateThread(NULL, 0, PingThread, (LPVOID)TEST_IPV4, 0, NULL);
-    if (hPingThread == NULL) {
-        fprintf(stderr, "  [ERROR] Failed to create ping thread. Error: %lu\n", GetLastError());
-        TapTun_Close(device);
+    unsigned char* acquired_data = packet.data;
+    void* acquired_token = packet.backend_token;
+    if (TapTun_AcquireSend(device, 20, &packet) != TAPTUN_ERROR_BUSY ||
+        packet.data != acquired_data || packet.backend_token != acquired_token) {
+        TapTun_CommitSend(device, &packet);
         return 1;
     }
-    
-    // 主线程在这里阻塞，等待 TAP 设备接收到数据，windows 也可能收到系统发起的各种广播数据包，ping 仅为了防止意外情况
-    unsigned char buffer[2048];
-    int bytesRead = TapTun_Read(device, buffer, sizeof(buffer));
 
-    if (bytesRead <= 0) {
-        fprintf(stderr, "  [ERROR] Failed to read from device. Error: %lu\n", GetLastError());
-    } else {
-        printf("  [SUCCESS] Read %d bytes from the TAP device!\n", bytesRead);
-        printf("  [INFO] This is likely the ICMP (ping) request packet.\n");
-        
-        int bytesToPrint = bytesRead < 128 ? bytesRead : 128;
-        
-        printf("  [INFO] Packet hex dump (first %d bytes): ", bytesToPrint);
-        for (int i = 0; i < bytesToPrint; ++i) {
-            printf("%02X ", buffer[i]);
+    memset(packet.data, 0, packet.size);
+    packet.data[0] = 0x45;
+    packet.data[2] = 0x00;
+    packet.data[3] = 0x14;
+    if (TapTun_CommitSend(device, &packet) != TAPTUN_OK || packet.data != NULL || packet.size != 0) {
+        return 1;
+    }
+    return TapTun_CommitSend(device, &packet) == TAPTUN_ERROR_INVALID_ARGUMENT ? 0 : 1;
+}
+
+static char* utf8_from_wide(const wchar_t* value) {
+    int length = WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        value,
+        -1,
+        NULL,
+        0,
+        NULL,
+        NULL);
+    if (length <= 0) return NULL;
+    char* result = (char*)malloc((size_t)length);
+    if (!result) return NULL;
+    if (WideCharToMultiByte(
+            CP_UTF8,
+            WC_ERR_INVALID_CHARS,
+            value,
+            -1,
+            result,
+            length,
+            NULL,
+            NULL) == 0) {
+        free(result);
+        return NULL;
+    }
+    return result;
+}
+
+int wmain(int argc, wchar_t** argv) {
+    TapTunPerformanceOptions performance;
+    memset(&performance, 0, sizeof(performance));
+    performance.struct_size = sizeof(performance);
+    performance.required_features = TAPTUN_PERF_IO_URING_SEND;
+    if (TapTun_OpenWithPerformance(NULL, &performance) != NULL ||
+        GetLastError() != ERROR_NOT_SUPPORTED) {
+        fprintf(stderr, "Unsupported required performance options were accepted.\n");
+        return 1;
+    }
+
+    TapTunCallbackOptions callback_options;
+    memset(&callback_options, 0, sizeof(callback_options));
+    if (TapTun_OpenFromCallbacks(&callback_options) != NULL) {
+        fprintf(stderr, "Invalid callback options were accepted.\n");
+        return 1;
+    }
+
+    CallbackContext context = { 0, 0 };
+    callback_options.context = &context;
+    callback_options.read = callback_read;
+    callback_options.write = callback_write;
+    callback_options.close = callback_close;
+    unsigned char packet[16];
+    TapTunDevice* callback_device = TapTun_OpenFromCallbacks(&callback_options);
+    if (!callback_device || TapTun_Read(callback_device, packet, sizeof(packet)) != 4 ||
+        TapTun_Write(callback_device, packet, 4) != 4 ||
+        test_unsupported_zero_copy(callback_device) != 0) {
+        if (callback_device) TapTun_Close(callback_device);
+        fprintf(stderr, "Callback TUN test failed.\n");
+        return 1;
+    }
+    TapTunBuffer callback_batch[2] = {
+        { packet, sizeof(packet), 4 },
+        { packet, sizeof(packet), 4 }
+    };
+    if (TapTun_ReadBatch(callback_device, callback_batch, 2) != 1 ||
+        callback_batch[0].size != 4) {
+        TapTun_Close(callback_device);
+        fprintf(stderr, "Callback batch API test failed.\n");
+        return 1;
+    }
+    callback_batch[0].size = 4;
+    callback_batch[1].size = 4;
+    if (TapTun_WriteBatch(callback_device, callback_batch, 2) != 2) {
+        TapTun_Close(callback_device);
+        fprintf(stderr, "Callback batch API test failed.\n");
+        return 1;
+    }
+    TapTun_Close(callback_device);
+    if (!context.closed || context.write_size != 4) return 1;
+    if (argc > 1 && wcscmp(argv[1], L"--callbacks-only") == 0) {
+        printf("Windows callback and batch API tests passed.\n");
+        return 0;
+    }
+
+    TapTunOptions invalid_options;
+    memset(&invalid_options, 0, sizeof(invalid_options));
+    invalid_options.ring_capacity = 12345;
+    if (TapTun_Open(&invalid_options) != NULL) {
+        fprintf(stderr, "Invalid Wintun ring capacity was accepted.\n");
+        return 1;
+    }
+
+    TapTunOptions options;
+    memset(&options, 0, sizeof(options));
+    options.name = "taptun-test";
+    options.open_mode = TAPTUN_OPEN_DEFAULT;
+    int name_explicit = 0;
+    char* requested_name = NULL;
+    char* requested_dll = NULL;
+    for (int index = 1; index < argc; ++index) {
+        if (wcscmp(argv[index], L"--tap-auto") == 0) {
+            options.mode = TAPTUN_MODE_TAP;
+            options.tap_backend = TAPTUN_TAP_BACKEND_AUTO;
+        } else if (wcscmp(argv[index], L"--tap-native") == 0) {
+            options.mode = TAPTUN_MODE_TAP;
+            options.tap_backend = TAPTUN_TAP_BACKEND_NATIVE_ONLY;
+        } else if (wcscmp(argv[index], L"--tap-emulated") == 0) {
+            options.mode = TAPTUN_MODE_TAP;
+            options.tap_backend = TAPTUN_TAP_BACKEND_EMULATED_ONLY;
+        } else if (wcscmp(argv[index], L"--name") == 0 && index + 1 < argc) {
+            free(requested_name);
+            requested_name = utf8_from_wide(argv[++index]);
+            if (!requested_name) {
+                fprintf(stderr, "Failed to convert the adapter name to UTF-8.\n");
+                free(requested_dll);
+                return 1;
+            }
+            options.name = requested_name;
+            name_explicit = 1;
+        } else {
+            // 未指定路径时由库从应用程序目录安全加载 wintun.dll
+            free(requested_dll);
+            requested_dll = utf8_from_wide(argv[index]);
+            if (!requested_dll) {
+                fprintf(stderr, "Failed to convert the Wintun path to UTF-8.\n");
+                free(requested_name);
+                return 1;
+            }
+            options.wintun_dll_path = requested_dll;
         }
-        printf("\n");
     }
+    if (options.mode == TAPTUN_MODE_TAP && !name_explicit) options.name = NULL;
+    TapTunDevice* device = TapTun_Open(&options);
+    if (!device) {
+        fprintf(
+            stderr,
+            "Failed to open the requested TUN/TAP backend. Win32 error: %lu.\n",
+            (unsigned long)TapTun_GetLastSystemError());
+        free(requested_name);
+        free(requested_dll);
+        return 1;
+    }
+    free(requested_name);
+    free(requested_dll);
 
-    printf("\n[5] Waiting for ping thread to finish...\n");
-    WaitForSingleObject(hPingThread, INFINITE);
-    CloseHandle(hPingThread); // 关闭线程句柄
-    printf("  [SUCCESS] Ping thread finished.\n");
-    
-    printf("\n[6] Closing device...\n");
+    int result = TapTun_Activate(device);
+    if (result != TAPTUN_OK) {
+        fprintf(stderr, "TapTun_Activate failed. Win32 error: %lu.\n",
+            (unsigned long)TapTun_GetLastSystemError());
+    }
+    if (result == TAPTUN_OK) {
+        result = TapTun_SetIPAddressV4(device, "10.10.0.1", 24);
+        if (result != TAPTUN_OK) {
+            fprintf(stderr, "TapTun_SetIPAddressV4 failed. Win32 error: %lu.\n",
+                (unsigned long)TapTun_GetLastSystemError());
+        }
+    }
+    if (result == TAPTUN_OK) {
+        result = TapTun_SetIPAddressV6(device, "fd10::1", 64);
+        if (result != TAPTUN_OK) {
+            fprintf(stderr, "TapTun_SetIPAddressV6 failed. Win32 error: %lu.\n",
+                (unsigned long)TapTun_GetLastSystemError());
+        }
+    }
+    if (result == TAPTUN_OK && options.mode == TAPTUN_MODE_TUN &&
+        test_wintun_zero_copy_send(device) != 0) {
+        result = TAPTUN_ERROR;
+    }
+    uint32_t capabilities = TapTun_GetCapabilities(device);
+    printf(
+        "%s name=%s index=%u capabilities=0x%08lx\n",
+        TapTun_GetMode(device) == TAPTUN_MODE_TAP ? "TAP" : "TUN",
+        TapTun_GetName(device),
+        TapTun_GetIndex(device),
+        (unsigned long)capabilities);
+    if (TapTun_GetMode(device) == TAPTUN_MODE_TAP) {
+        unsigned char mac[6];
+        if (TapTun_GetMacAddress(device, mac) != TAPTUN_OK) result = TAPTUN_ERROR;
+        else printf(
+            "TAP MAC=%02x:%02x:%02x:%02x:%02x:%02x backend=%s\n",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            (capabilities & TAPTUN_CAP_NATIVE_TAP) ? "tap-windows6" : "Wintun+tun2tap");
+    }
     TapTun_Close(device);
-    printf("  [SUCCESS] Device closed.\n");
-
-    printf("\n--- Test Finished ---\n");
-    printf("Press Enter to exit.\n");
-    getchar();
-
-    return 0;
+    return result == TAPTUN_OK ? 0 : 1;
 }
