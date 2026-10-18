@@ -313,6 +313,34 @@ static int prepare_peer_tcp_data(
     return 1;
 }
 
+static int matches_tcp_flow(
+    const TapTunBuffer* packet,
+    const struct sockaddr_in* local,
+    const struct sockaddr_in* peer) {
+    const unsigned char* data = packet->data;
+    if (packet->size < 40 || data[0] >> 4 != 4 || data[9] != IPPROTO_TCP) return 0;
+    uint32_t ip_size = (uint32_t)(data[0] & 0x0f) * 4;
+    if (ip_size < 20 || packet->size < ip_size + 20) return 0;
+    return memcmp(data + 12, &local->sin_addr, 4) == 0 &&
+        memcmp(data + 16, &peer->sin_addr, 4) == 0 &&
+        memcmp(data + ip_size, &local->sin_port, 2) == 0 &&
+        memcmp(data + ip_size + 2, &peer->sin_port, 2) == 0;
+}
+
+static int read_tcp_batch(
+    TapTunDevice* device,
+    TapTunBuffer* packets,
+    uint32_t packet_count,
+    const struct sockaddr_in* local,
+    const struct sockaddr_in* peer) {
+    /* A TUN carries IPv6 control traffic and packets from other connections.
+       ReadBatch splits one native packet, so its segments share one flow. */
+    for (;;) {
+        int count = TapTun_ReadBatch(device, packets, packet_count);
+        if (count <= 0 || matches_tcp_flow(&packets[0], local, peer)) return count;
+    }
+}
+
 static int test_native_gso_read(void) {
     TapTunOptions options;
     memset(&options, 0, sizeof(options));
@@ -339,6 +367,14 @@ static int test_native_gso_read(void) {
         TapTun_Close(device);
         return 1;
     }
+    /* This synthetic peer never ACKs all outbound data or completes a FIN
+       handshake. Abort on close instead of leaving an orphan to retransmit. */
+    struct linger abort_on_close = { 1, 0 };
+    if (setsockopt(client, SOL_SOCKET, SO_LINGER, &abort_on_close, sizeof(abort_on_close)) != 0) {
+        close(client);
+        TapTun_Close(device);
+        return 1;
+    }
     struct sockaddr_in peer;
     memset(&peer, 0, sizeof(peer));
     peer.sin_family = AF_INET;
@@ -349,10 +385,17 @@ static int test_native_gso_read(void) {
         TapTun_Close(device);
         return 1;
     }
+    struct sockaddr_in local;
+    socklen_t local_size = sizeof(local);
+    if (getsockname(client, (struct sockaddr*)&local, &local_size) != 0) {
+        close(client);
+        TapTun_Close(device);
+        return 1;
+    }
 
     unsigned char handshake_packet[2048];
     TapTunBuffer handshake = { handshake_packet, sizeof(handshake_packet), 0 };
-    int packet_count = TapTun_ReadBatch(device, &handshake, 1);
+    int packet_count = read_tcp_batch(device, &handshake, 1, &local, &peer);
     unsigned char saved_syn[128];
     uint32_t saved_syn_size = handshake.size < sizeof(saved_syn)
         ? handshake.size
@@ -380,7 +423,24 @@ static int test_native_gso_read(void) {
 
     // Drain the final handshake ACK before measuring the first data burst.
     handshake.size = 0;
-    if (TapTun_ReadBatch(device, &handshake, 1) != 1) {
+    if (read_tcp_batch(device, &handshake, 1, &local, &peer) != 1) {
+        close(client);
+        TapTun_Close(device);
+        return 1;
+    }
+    /* Queue a different TCP connection before the data burst. This makes the
+       old assumption that the next native packet is our GSO packet fail on
+       every run, even when the interface emits no IPv6 control packets. */
+    int background_client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (background_client < 0) {
+        close(client);
+        TapTun_Close(device);
+        return 1;
+    }
+    int background_result = connect(background_client, (struct sockaddr*)&peer, sizeof(peer));
+    int background_error = errno;
+    close(background_client);
+    if (background_result != -1 || background_error != EINPROGRESS) {
         close(client);
         TapTun_Close(device);
         return 1;
@@ -400,7 +460,7 @@ static int test_native_gso_read(void) {
         packets[index].capacity = sizeof(packet_storage[index]);
         packets[index].size = 0;
     }
-    packet_count = TapTun_ReadBatch(device, packets, 64);
+    packet_count = read_tcp_batch(device, packets, 64, &local, &peer);
     if (packet_count <= 1) {
         close(client);
         TapTun_Close(device);
@@ -678,7 +738,11 @@ int main(int argc, char** argv) {
         return test_native_performance();
     }
     if (argc > 1 && strcmp(argv[1], "--native-gso-read") == 0) {
-        return test_native_gso_read();
+        /* A missing matching packet must fail instead of hanging the filter. */
+        alarm(20);
+        int result = test_native_gso_read();
+        alarm(0);
+        return result;
     }
     printf("External-handle TUN test passed.\n");
     return 0;
