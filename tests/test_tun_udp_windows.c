@@ -45,7 +45,7 @@ DWORD WINAPI UdpToTapThread(LPVOID lpParam) {
         bytes_received = recvfrom(args->udp_socket, (char*)buffer, sizeof(buffer), 0,
                                   (struct sockaddr*)&sender_addr, &sender_addr_len);
         if (bytes_received > 0) {
-            TapTun_Write(args->tun_device, buffer, bytes_received);
+            if (TapTun_Write(args->tun_device, buffer, bytes_received) < 0) break;
         } else {
             fprintf(stderr, "[THREAD UDP->TUN] recvfrom failed with error: %d\n", WSAGetLastError());
             break;
@@ -126,11 +126,12 @@ int main(int argc, char* argv[]) {
     getchar();
 
     printf("Shutting down...\n");
-    TerminateThread(hTapToUdp, 0); // 简单粗暴地终止线程
-    TerminateThread(hUdpToTap, 0);
+    (void)TapTun_Shutdown(tun);
+    closesocket(udp_sock);
+    HANDLE workers[2] = { hTapToUdp, hUdpToTap };
+    WaitForMultipleObjects(2, workers, TRUE, INFINITE);
     CloseHandle(hTapToUdp);
     CloseHandle(hUdpToTap);
-    closesocket(udp_sock);
     TapTun_Close(tun);
     WSACleanup();
 

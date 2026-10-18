@@ -47,6 +47,8 @@ sudo ./bin/test_linux --native-gso-read
 
 不带 `--native` 的 Linux/通用 POSIX 测试只验证外部句柄接入，不需要 root 权限。
 
+`make test` 还会构建 `test_lifecycle`（Windows 为 `.exe`），验证整批包长预检、并发及重复 Shutdown、阻塞回调退出和释放顺序。Linux/POSIX 的 `test_posix_shutdown` 覆盖非阻塞外部 fd 的读写取消；Linux 的 `test_linux_uring_shutdown` 用注入测试覆盖提交失败、取消和满队列等待。Windows 的 `test_windows_shutdown.exe` 验证 OVERLAPPED 取消后的完成等待和 Wintun 租约生命周期。请分别运行这些测试程序。
+
 ## Windows 后端
 
 本仓库只包含采用 MIT 选项使用的 `wintun.h`，不提供、下载或安装 `wintun.dll`。调用方应从 [Wintun 官方网站](https://www.wintun.net/)获取与目标架构匹配的 DLL，并通过 `TapTunOptions.wintun_dll_path` 显式传入路径，或将其放在应用程序目录中。
@@ -101,7 +103,7 @@ uint32_t capabilities = TapTun_GetCapabilities(device);
 
 通过 `TAPTUN_CAP_NATIVE_TAP` 与 `TAPTUN_CAP_EMULATED_TAP` 判断实际后端。`TapTun_Read`/`TapTun_Write` 在 TAP 模式下读写完整 Ethernet II 帧。
 
-Android 等平台由系统创建 TUN 后，使用：
+Android 等平台由系统创建 TUN 后，先将 fd 设为 `O_NONBLOCK`，再使用（本库不会修改宿主 fd 的共享标志；库创建的设备会自动设置）：
 
 ```c
 TapTunHandleOptions options = {0};
@@ -115,7 +117,15 @@ TapTunDevice* device = TapTun_OpenFromHandle(&options);
 
 此时地址、路由和 DNS 通常由宿主平台 VPN API 配置。
 
-不提供 fd 的平台使用 `TapTun_OpenFromCallbacks`。回调从本库视角是同步的，`close` 必须唤醒正在阻塞的 `read`。模拟 TAP 还要求提供 `interrupt_read`；库生成 ARP/NDP 回复时会调用它，随后 `read` 应返回 `TAPTUN_ERROR_BUSY`，使库从内部回复队列继续读取。
+不提供 fd 的平台使用 `TapTun_OpenFromCallbacks`。回调从本库视角是同步的，必须提供 `read`、`write`、`cancel` 和 `close`。`cancel` 必须线程安全、及时返回，持久地取消当前及后续读写，并唤醒阻塞的读写；它不能释放上下文或 I/O 资源。与取消并发进入的回调也必须观察取消状态并返回 `TAPTUN_ERROR_CLOSED`。`close` 只在最终释放时调用，此时读写回调均已退出。模拟 TAP 还要求提供 `interrupt_read`；库生成 ARP/NDP 回复时会调用它，随后 `read` 应返回 `TAPTUN_ERROR_BUSY`，使库从内部回复队列继续读取。`interrupt_read` 只是临时唤醒，必须能与 `cancel` 并发执行。
+
+此次 `TapTunCallbackOptions` 布局发生 ABI 变化：宿主必须添加 `cancel`，并使用新头文件重新编译。
+
+## 关闭与并发
+
+存在工作线程时，使用 `TapTun_Shutdown(device)` → 等待全部工作线程退出 → `TapTun_Close(device)` 的顺序。Shutdown 可并发、重复调用；它停止新 I/O、取消阻塞读写并等待活动调用退出，同时保留设备对象、后端资源及未归还的租约存储。正在执行的操作可能成功完成；批量写停止后返回已接受的前缀数量，尚未接受任何包时返回负数错误。Shutdown 后的有效读写、借用及提交调用返回 `TAPTUN_ERROR_CLOSED`，已有接收租约仍可归还。不得在后端回调内调用 Shutdown 或 Close。
+
+Close 内部也会调用 Shutdown，但最终 Close 必须由所有者独占执行一次：调用期间及之后，不允许其他线程再访问设备或借用的包。无工作线程时可直接 Close。Shutdown 的返回值表示关闭收敛结果；Linux io_uring 的提交、完成或取消错误会返回错误，即使如此仍须等待工作线程退出并最终 Close。Shutdown 不保证已提交包一定交付到网络。
 
 ## Linux 性能配置
 
@@ -140,7 +150,7 @@ preferred 功能不受平台或内核支持时会回退，required 功能无法�
 
 io_uring 只用于 `TapTun_AcquireSend`/`TapTun_CommitSend`。打开时一次注册 TUN/TAP 队列 fd 和固定缓冲池，调用方直接在取得的缓冲区中构造包；`TapTun_CommitSend` 转移所有权并异步提交，缓冲池耗尽时下一次 acquire 会等待 CQE 回收。`TapTun_Write` 始终保持直接同步写，不会为了使用 io_uring 增加一次内部复制。这里的零拷贝指不发生额外的用户态缓冲区复制，内核仍需把数据构造成网络包。
 
-io_uring 不保证单线程逐包提交比直接 `write` 更快，因此只应在调用方可以直接构造发送缓冲区、维持多个在途提交并经过实际负载测试后启用。`TapTun_Close` 会丢弃尚未 commit 的租约，并等待已提交请求完成后再释放注册缓冲区。
+io_uring 不保证单线程逐包提交比直接 `write` 更快，因此只应在调用方可以直接构造发送缓冲区、维持多个在途提交并经过实际负载测试后启用。`TapTun_Shutdown` 会取消并等待已提交请求完成，尚未 commit 的租约不能再提交，但其存储保留到最终 `TapTun_Close`。
 
 `TAPTUN_PERF_GSO` 当前只支持 Linux 原生 TUN 的 TCP/IPv4 和 TCP/IPv6。成功启用后返回 `TAPTUN_CAP_GSO`，后端通过 `IFF_VNET_HDR`、`TUNSETOFFLOAD` 隐藏 Linux virtio-net 元数据：
 
@@ -163,6 +173,8 @@ if (count > 0) {
 }
 ```
 
+`TapTun_Write` 和 `TapTun_WriteBatch` 的包长上限一致：TUN 为 65535 字节，TAP 为 65549 字节。WriteBatch 在写入前检查整批指针及长度；参数非法时整批拒绝，不写出前缀。后端运行时失败则保留已接受包数的返回约定。`capacity` 在 WriteBatch 中仍被忽略。
+
 批量 API 在所有平台都存在，其他后端按普通包处理，因此跨平台调用方不需要宏定义，也不会触发仅返回 `UNSUPPORTED` 的热路径。GSO/GRO 只是本机 TUN 边界的批处理：公网仍传输独立的普通 MTU 隧道包，接收端不会等待恢复发送端原来的 64 KiB 边界。调用方应把虚拟网卡 MTU 设置为公网 Path MTU 减去隧道、加密、UDP 和 IP 头开销。
 
 ## 零拷贝收发
@@ -179,7 +191,7 @@ if (TapTun_GetCapabilities(device) & TAPTUN_CAP_ZERO_COPY_SEND) {
 }
 ```
 
-接收数据在 `TapTun_ReleaseReceive` 前有效；发送缓冲区在 `TapTun_CommitSend` 前有效。每个设备同时只允许一个接收租约和一个尚未提交的发送租约，但 Linux 可以保留多个已经 commit 的在途缓冲区。异步完成错误会由后续 `TapTun_AcquireSend` 返回。`TapTun_Close` 会使尚未归还的租约立即失效，因此调用方不应在关闭后再访问 `TapTunPacket`。
+接收数据在 `TapTun_ReleaseReceive` 前有效；发送缓冲区在 `TapTun_CommitSend` 前有效。每个设备同时只允许一个接收租约和一个尚未提交的发送租约，但 Linux 可以保留多个已经 commit 的在途缓冲区。异步完成错误会由后续 `TapTun_AcquireSend` 返回。Shutdown 不释放借用的存储；未提交的发送租约在 Shutdown 后由最终 Close 回收。`TapTun_Close` 使所有剩余租约失效，因此必须先停止访问这些缓冲区。
 
 ## 性能测试示范
 

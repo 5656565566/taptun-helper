@@ -47,6 +47,8 @@ sudo ./bin/test_linux --native-gso-read
 
 Without `--native`, Linux and generic POSIX tests only exercise externally supplied handles and do not require root access.
 
+`make test` also builds `test_lifecycle` (`.exe` on Windows) for batch validation, concurrent/repeated Shutdown, blocked callbacks, and final release ordering. Run `test_posix_shutdown` on Linux/POSIX for fd cancellation, `test_linux_uring_shutdown` on Linux for injected submission/cancellation/backpressure paths, and `test_windows_shutdown.exe` for OVERLAPPED completion and Wintun lease lifetimes.
+
 ## Windows Backends
 
 This repository includes only `wintun.h`, selected under its MIT option. It does not provide, download, or install `wintun.dll`. The caller must obtain the correct DLL architecture from the [official Wintun website](https://www.wintun.net/) and pass its path through `TapTunOptions.wintun_dll_path`, or place it in the application directory.
@@ -115,7 +117,17 @@ TapTunDevice* device = TapTun_OpenFromHandle(&options);
 
 Address, route, and DNS configuration is normally owned by the host VPN API in this mode.
 
-Platforms that do not expose an fd can use `TapTun_OpenFromCallbacks`. Callbacks are synchronous from the library's point of view, and `close` must unblock a pending `read`. Emulated TAP additionally requires `interrupt_read`; when the library queues an ARP/NDP reply it calls this callback, after which `read` should return `TAPTUN_ERROR_BUSY` so the internal reply queue can be read.
+POSIX handles passed to `TapTun_OpenFromHandle` must already have `O_NONBLOCK` set and retain it until Close. The library does not change the host fd's shared flags; devices opened by the library are configured automatically. Read and Write still provide synchronous, cancellable waits.
+
+Platforms without an fd can use `TapTun_OpenFromCallbacks`. Synchronous `read`, `write`, `cancel`, and `close` callbacks are required. `cancel` must be thread safe, return promptly, permanently cancel pending and future reads/writes, and wake blocked callbacks without freeing their context or resources. A callback racing with cancellation must observe the persistent cancellation state and return `TAPTUN_ERROR_CLOSED`. Final `close` runs after active callbacks return. Emulated TAP also requires `interrupt_read`: queued ARP/NDP replies temporarily wake `read`, which should return `TAPTUN_ERROR_BUSY`. This transient notification must tolerate concurrent `cancel`.
+
+`TapTunCallbackOptions` has an ABI change: hosts must provide `cancel` and recompile against the new header.
+
+## Shutdown and Concurrency
+
+With worker threads, call `TapTun_Shutdown(device)`, join every worker, then call `TapTun_Close(device)` exactly once. Shutdown supports concurrent and repeated calls. It stops new I/O, cancels blocked reads/writes, and waits for active calls while retaining the object, backend resources, and outstanding lease storage. Operations already in progress may complete successfully. A stopped batch returns the accepted prefix count, or a negative error if none were accepted. Valid reads, writes, acquisitions, and send commits after Shutdown return `TAPTUN_ERROR_CLOSED`; existing receive leases can still be released. Do not call Shutdown or Close from a backend callback.
+
+Final Close also invokes Shutdown, but the owner must ensure no other thread accesses the device or borrowed packets during or after Close. Without workers, direct Close is sufficient. Check the Shutdown result: Linux io_uring submission, completion, or cancellation errors are reported even though workers must still be joined and Close must still run. Shutdown does not guarantee network delivery of accepted packets.
 
 ## Linux Performance Configuration
 
@@ -140,7 +152,7 @@ An unavailable preferred feature falls back, while opening fails when a required
 
 io_uring is used only by `TapTun_AcquireSend`/`TapTun_CommitSend`. The backend registers the TUN/TAP queue fds and a fixed buffer pool once during open. The caller builds directly in acquired storage, and `TapTun_CommitSend` transfers ownership and submits asynchronously. A later acquire waits for a CQE when the pool is exhausted. `TapTun_Write` always remains a direct synchronous write and does not add an internal copy merely to use io_uring. Zero-copy here means no additional user-space buffer copy; the kernel still constructs a network packet from the data.
 
-Per-packet io_uring submission is not guaranteed to outperform direct `write` in a single producer. Enable it only when the caller can build directly in leased storage, maintain multiple in-flight submissions, and has measured its real workload. `TapTun_Close` discards an uncommitted lease and waits for submitted requests before releasing registered storage.
+Per-packet io_uring submission is not guaranteed to outperform direct `write` in a single producer. Enable it only when the caller can build directly in leased storage, maintain multiple in-flight submissions, and has measured its real workload. `TapTun_Shutdown` cancels and drains submitted requests. An uncommitted lease cannot be committed afterward, but its storage remains valid until final `TapTun_Close`.
 
 `TAPTUN_PERF_GSO` currently supports TCP/IPv4 and TCP/IPv6 on native Linux TUN only. A successfully enabled device reports `TAPTUN_CAP_GSO`. The backend uses `IFF_VNET_HDR` and `TUNSETOFFLOAD` while keeping Linux virtio-net metadata private:
 
@@ -163,6 +175,8 @@ if (count > 0) {
 }
 ```
 
+`TapTun_Write` and `TapTun_WriteBatch` share the same size limits: 65535 bytes for TUN and 65549 bytes for TAP. WriteBatch checks every pointer and length before writing anything, rejecting an invalid batch without sending its prefix. Runtime backend errors retain the accepted-prefix return convention. WriteBatch still ignores `capacity`.
+
 The batch API exists on every platform. Other backends process ordinary packets, so cross-platform callers need neither preprocessor guards nor hot-path calls that only return `UNSUPPORTED`. GSO/GRO is local batching at the TUN boundary: the public network still carries independent ordinary-MTU tunnel packets, and the receiver never waits to reconstruct the sender's original 64 KiB boundary. Configure the virtual interface MTU as the public Path MTU minus tunnel, encryption, UDP, and IP overhead.
 
 ## Zero-Copy I/O
@@ -179,7 +193,7 @@ if (TapTun_GetCapabilities(device) & TAPTUN_CAP_ZERO_COPY_SEND) {
 }
 ```
 
-Received data remains valid until `TapTun_ReleaseReceive`; send storage remains valid until `TapTun_CommitSend`. Each device allows one receive lease and one uncommitted send lease at a time, while Linux can retain multiple committed buffers in flight. A later `TapTun_AcquireSend` reports asynchronous completion errors. `TapTun_Close` immediately invalidates outstanding leases, so callers must not access a `TapTunPacket` after close.
+Received data remains valid until `TapTun_ReleaseReceive`; send storage remains valid until `TapTun_CommitSend`. Each device allows one receive lease and one uncommitted send lease at a time, while Linux can retain multiple committed buffers in flight. A later `TapTun_AcquireSend` reports asynchronous completion errors. Shutdown preserves borrowed storage; final Close reclaims uncommitted send leases and invalidates all remaining leases. Stop accessing borrowed storage before Close.
 
 ## Performance Benchmark Example
 

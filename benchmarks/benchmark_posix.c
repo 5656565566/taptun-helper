@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -291,6 +292,11 @@ static int open_target(
 
     int sockets[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) != 0) return TAPTUN_ERROR;
+    if (fcntl(sockets[0], F_SETFL, fcntl(sockets[0], F_GETFL) | O_NONBLOCK) < 0) {
+        close(sockets[0]);
+        close(sockets[1]);
+        return TAPTUN_ERROR;
+    }
     TapTunHandleOptions options;
     memset(&options, 0, sizeof(options));
     options.handle = sockets[0];

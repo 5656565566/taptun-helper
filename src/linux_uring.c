@@ -1,4 +1,5 @@
 #include "linux_uring.h"
+#include "posix_io.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -45,12 +46,16 @@ struct TapTunLinuxUring {
     TapTunSendSlot* slots;
     struct iovec* buffers;
     unsigned char* buffer_storage;
+    size_t buffer_storage_size;
     uint32_t slot_count;
     uint32_t packet_capacity;
     uint32_t packet_prefix_size;
     uint32_t queue_count;
     uint32_t acquired_index;
     uint32_t in_flight;
+    uint32_t cancel_in_flight;
+    int cancel_error;
+    int shutting_down;
     int registered_files;
     int registered_buffers;
     int completion_error;
@@ -122,14 +127,18 @@ static uint32_t reap_completions(TapTunLinuxUring* ring) {
     while (head != tail) {
         struct io_uring_cqe* completion = &ring->cqes[head & *ring->cq_ring_mask];
         uint64_t identity = completion->user_data;
-        if (identity == 0 || identity > ring->slot_count) {
+        if (identity == UINT64_MAX && ring->cancel_in_flight != 0) {
+            --ring->cancel_in_flight;
+            if (completion->res < 0 && completion->res != -ENOENT &&
+                completion->res != -EALREADY) ring->cancel_error = -completion->res;
+        } else if (identity == 0 || identity > ring->slot_count) {
             record_completion_error(ring, -EIO);
         } else {
             TapTunSendSlot* slot = &ring->slots[identity - 1];
             if (slot->state != TAPTUN_SEND_SLOT_IN_FLIGHT) {
                 record_completion_error(ring, -EIO);
             } else {
-                if (completion->res !=
+                if (!(ring->shutting_down && completion->res == -ECANCELED) && completion->res !=
                     (int)(slot->expected_size + ring->packet_prefix_size)) {
                     record_completion_error(ring, completion->res);
                 }
@@ -149,8 +158,13 @@ static int wait_for_completions(TapTunLinuxUring* ring) {
     if (!ring->cq_head || !ring->cq_tail || !ring->cq_ring_mask || !ring->cqes) {
         return ring->in_flight == 0 ? TAPTUN_OK : TAPTUN_ERROR;
     }
-    while (ring->in_flight != 0) {
-        if (reap_completions(ring) != 0) continue;
+    while (ring->in_flight != 0 || ring->cancel_in_flight != 0) {
+        uint32_t reaped = reap_completions(ring);
+        if (ring->cancel_error) {
+            errno = ring->cancel_error;
+            return TAPTUN_ERROR;
+        }
+        if (reaped != 0) continue;
         int result;
         do {
             result = ring_enter(ring->fd, 0, 1);
@@ -173,8 +187,9 @@ static void destroy_ring_resources(TapTunLinuxUring* ring) {
                 (void)ring_register(ring->fd, IORING_UNREGISTER_FILES, NULL, 0);
             }
         } else {
-            // Closing the ring synchronously cancels or completes requests
-            // before their registered storage is released below.
+            // Ring teardown may finish asynchronously. Registered packet pages
+            // have a dedicated mapping so they cannot be reused by malloc while
+            // the kernel still holds references to them.
             close(ring->fd);
             ring->fd = -1;
         }
@@ -190,7 +205,9 @@ static void destroy_ring_resources(TapTunLinuxUring* ring) {
         munmap(ring->sq_ring_mapping, ring->sq_ring_mapping_size);
     }
     if (ring->fd >= 0) close(ring->fd);
-    free(ring->buffer_storage);
+    if (ring->buffer_storage && ring->buffer_storage != MAP_FAILED) {
+        munmap(ring->buffer_storage, ring->buffer_storage_size);
+    }
     free(ring->buffers);
     free(ring->slots);
     free(ring);
@@ -307,13 +324,10 @@ TapTunLinuxUring* taptun_linux_uring_create(
         return NULL;
     }
 
-    long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) page_size = 4096;
-    if (posix_memalign(
-            (void**)&ring->buffer_storage,
-            (size_t)page_size,
-            stride * queue_depth) != 0) {
-        errno = ENOMEM;
+    ring->buffer_storage_size = stride * queue_depth;
+    ring->buffer_storage = mmap(NULL, ring->buffer_storage_size,
+        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ring->buffer_storage == MAP_FAILED) {
         destroy_ring_resources(ring);
         return NULL;
     }
@@ -339,7 +353,8 @@ TapTunLinuxUring* taptun_linux_uring_create(
 int taptun_linux_uring_acquire(
     TapTunLinuxUring* ring,
     uint32_t packet_size,
-    TapTunPacket* packet) {
+    TapTunPacket* packet,
+    int stop_fd) {
     if (!ring || !packet || packet_size == 0 || packet_size > ring->packet_capacity) {
         return TAPTUN_ERROR_INVALID_ARGUMENT;
     }
@@ -372,13 +387,8 @@ int taptun_linux_uring_acquire(
         }
         if (ring->in_flight == 0) return TAPTUN_ERROR_BUSY;
 
-        // Backpressure waits for one CQE instead of forcing callers to spin
-        // when every registered buffer is owned by the kernel.
-        int result;
-        do {
-            result = ring_enter(ring->fd, 0, 1);
-        } while (result < 0 && errno == EINTR);
-        if (result < 0) return TAPTUN_ERROR;
+        int result = taptun_wait_io(ring->fd, POLLIN, stop_fd);
+        if (result != TAPTUN_OK) return result;
     }
 }
 
@@ -441,6 +451,14 @@ int taptun_linux_uring_commit(
     } while (result < 0 && errno == EINTR);
     if (result <= 0) {
         ring->fatal_error = result < 0 ? errno : EIO;
+        /* No SQPOLL producer exists. Roll back an SQE that the kernel did not
+           consume, otherwise shutdown would wait for a CQE that cannot exist. */
+        if (load_acquire(ring->sq_head) == tail) {
+            store_release(ring->sq_tail, tail);
+            slot->state = TAPTUN_SEND_SLOT_FREE;
+            slot->expected_size = 0;
+            --ring->in_flight;
+        }
         errno = ring->fatal_error;
         return TAPTUN_ERROR;
     }
@@ -453,6 +471,58 @@ void taptun_linux_uring_cancel_acquired(TapTunLinuxUring* ring) {
     slot->expected_size = 0;
     slot->state = TAPTUN_SEND_SLOT_FREE;
     ring->acquired_index = UINT32_MAX;
+}
+
+int taptun_linux_uring_shutdown(TapTunLinuxUring* ring) {
+    if (!ring) return TAPTUN_ERROR_INVALID_ARGUMENT;
+    ring->shutting_down = 1;
+    reap_completions(ring);
+    for (uint32_t index = 0; index < ring->slot_count; ++index) {
+        if (ring->slots[index].state != TAPTUN_SEND_SLOT_IN_FLIGHT) continue;
+        unsigned int tail = *ring->sq_tail;
+        unsigned int head = load_acquire(ring->sq_head);
+        if (tail - head >= *ring->sq_ring_entries) {
+            ring->fatal_error = EBUSY;
+            errno = ring->fatal_error;
+            return TAPTUN_ERROR;
+        }
+        unsigned int sqe_index = tail & *ring->sq_ring_mask;
+        struct io_uring_sqe* submission = &ring->sqes[sqe_index];
+        memset(submission, 0, sizeof(*submission));
+        submission->opcode = IORING_OP_ASYNC_CANCEL;
+        submission->addr = (uint64_t)index + 1u;
+        submission->user_data = UINT64_MAX;
+        ring->sq_array[sqe_index] = sqe_index;
+        ++ring->cancel_in_flight;
+        store_release(ring->sq_tail, tail + 1);
+        int result;
+        do {
+            result = ring_enter(ring->fd, 1, 0);
+        } while (result < 0 && errno == EINTR);
+        if (result <= 0) {
+            ring->fatal_error = result < 0 ? errno : EIO;
+            if (load_acquire(ring->sq_head) == tail) {
+                store_release(ring->sq_tail, tail);
+                --ring->cancel_in_flight;
+            }
+            errno = ring->fatal_error;
+            return TAPTUN_ERROR;
+        }
+        /* Reap each cancellation so the CQ cannot overflow during shutdown. */
+        reap_completions(ring);
+    }
+    int result = wait_for_completions(ring);
+    if (result != TAPTUN_OK) {
+        ring->fatal_error = errno;
+        return result;
+    }
+    int error = ring->fatal_error != 0 ? ring->fatal_error
+        : ring->cancel_error != 0 ? ring->cancel_error : ring->completion_error;
+    if (error) {
+        errno = error;
+        return TAPTUN_ERROR;
+    }
+    return TAPTUN_OK;
 }
 
 void taptun_linux_uring_destroy(TapTunLinuxUring* ring) {

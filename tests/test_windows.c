@@ -1,3 +1,4 @@
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,10 +10,11 @@
 typedef struct {
     int closed;
     int write_size;
+    atomic_int cancelled;
 } CallbackContext;
 
 static int callback_read(void* context, unsigned char* buffer, int buffer_size) {
-    (void)context;
+    if (atomic_load(&((CallbackContext*)context)->cancelled)) return TAPTUN_ERROR_CLOSED;
     if (buffer_size < 4) return TAPTUN_ERROR_BUFFER_TOO_SMALL;
     const unsigned char packet[] = { 0x45, 0x00, 0x00, 0x14 };
     memcpy(buffer, packet, sizeof(packet));
@@ -20,9 +22,14 @@ static int callback_read(void* context, unsigned char* buffer, int buffer_size) 
 }
 
 static int callback_write(void* context, const unsigned char* data, int data_size) {
+    if (atomic_load(&((CallbackContext*)context)->cancelled)) return TAPTUN_ERROR_CLOSED;
     (void)data;
     ((CallbackContext*)context)->write_size = data_size;
     return data_size;
+}
+
+static void callback_cancel(void* context) {
+    atomic_store(&((CallbackContext*)context)->cancelled, 1);
 }
 
 static void callback_close(void* context) {
@@ -115,10 +122,11 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
 
-    CallbackContext context = { 0, 0 };
+    CallbackContext context = {0};
     callback_options.context = &context;
     callback_options.read = callback_read;
     callback_options.write = callback_write;
+    callback_options.cancel = callback_cancel;
     callback_options.close = callback_close;
     unsigned char packet[16];
     TapTunDevice* callback_device = TapTun_OpenFromCallbacks(&callback_options);

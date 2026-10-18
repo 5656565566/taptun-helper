@@ -1,6 +1,7 @@
 #include "taptun_api.h"
 #include "tap-windows6.h"
 #include "tun2tap.h"
+#include "taptun_internal.h"
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunknown-pragmas"
@@ -50,6 +51,7 @@ struct TapTunDevice {
     int active_read;
     int active_send_lease;
     int closing;
+    int shutdown_complete;
     int uses_callbacks;
     TapTunCallbackOptions callbacks;
     BYTE* acquired_receive_packet;
@@ -440,6 +442,13 @@ static int begin_operation(TapTunDevice* device, int is_read) {
     return TAPTUN_OK;
 }
 
+static int operation_is_closing(TapTunDevice* device) {
+    EnterCriticalSection(&device->state_lock);
+    int closing = device->closing;
+    LeaveCriticalSection(&device->state_lock);
+    return closing;
+}
+
 static void end_operation_locked(TapTunDevice* device, int is_read) {
     --device->active_operations;
     if (is_read) device->active_read = 0;
@@ -597,7 +606,10 @@ TapTunDevice* TapTun_OpenFromHandle(const TapTunHandleOptions* options) {
 }
 
 TapTunDevice* TapTun_OpenFromCallbacks(const TapTunCallbackOptions* options) {
-    if (!options || !options->read || !options->write || !options->close) return NULL;
+    if (!options || !options->read || !options->write || !options->cancel || !options->close) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
     if ((options->backend_mode != TAPTUN_MODE_TUN && options->backend_mode != TAPTUN_MODE_TAP) ||
         (options->mode != TAPTUN_MODE_TUN && options->mode != TAPTUN_MODE_TAP) ||
         (options->mode == TAPTUN_MODE_TUN && options->backend_mode != TAPTUN_MODE_TUN)) {
@@ -839,6 +851,29 @@ static int enqueue_synthetic_frame(
     return TAPTUN_OK;
 }
 
+static int finish_tap_io(TapTunDevice* device, OVERLAPPED* overlapped) {
+    HANDLE handles[2] = { overlapped->hEvent, device->close_event };
+    DWORD waited = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+    DWORD wait_error = waited == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+    if (waited != WAIT_OBJECT_0) {
+        (void)CancelIoEx(device->tap_handle, overlapped);
+    }
+    DWORD transferred = 0;
+    /* CancelIoEx requests cancellation; only completion releases OVERLAPPED
+       and the caller's buffer. This also covers I/O issued after Shutdown's
+       initial CancelIoEx(handle, NULL). */
+    BOOL completed = GetOverlappedResult(device->tap_handle, overlapped, &transferred, TRUE);
+    DWORD error = completed ? ERROR_SUCCESS : GetLastError();
+    if (waited == WAIT_OBJECT_0 + 1 || error == ERROR_OPERATION_ABORTED) {
+        return TAPTUN_ERROR_CLOSED;
+    }
+    if (waited != WAIT_OBJECT_0 || !completed) {
+        SetLastError(wait_error != ERROR_SUCCESS ? wait_error : error);
+        return TAPTUN_ERROR;
+    }
+    return (int)transferred;
+}
+
 static int read_tap_windows6(TapTunDevice* device, unsigned char* buffer, int buffer_size) {
     OVERLAPPED overlapped;
     memset(&overlapped, 0, sizeof(overlapped));
@@ -850,14 +885,7 @@ static int read_tap_windows6(TapTunDevice* device, unsigned char* buffer, int bu
     }
     DWORD error = GetLastError();
     if (error != ERROR_IO_PENDING) return TAPTUN_ERROR;
-    HANDLE wait_handles[2] = { overlapped.hEvent, device->close_event };
-    DWORD wait_result = WaitForMultipleObjects(2, wait_handles, FALSE, INFINITE);
-    if (wait_result == WAIT_OBJECT_0 + 1) return TAPTUN_ERROR_CLOSED;
-    if (wait_result != WAIT_OBJECT_0 ||
-        !GetOverlappedResult(device->tap_handle, &overlapped, &bytes_read, FALSE)) {
-        return GetLastError() == ERROR_OPERATION_ABORTED ? TAPTUN_ERROR_CLOSED : TAPTUN_ERROR;
-    }
-    return (int)bytes_read;
+    return finish_tap_io(device, &overlapped);
 }
 
 static int write_tap_windows6(TapTunDevice* device, const unsigned char* data, int data_size) {
@@ -871,14 +899,7 @@ static int write_tap_windows6(TapTunDevice* device, const unsigned char* data, i
     }
     DWORD error = GetLastError();
     if (error != ERROR_IO_PENDING) return TAPTUN_ERROR;
-    HANDLE wait_handles[2] = { overlapped.hEvent, device->close_event };
-    DWORD wait_result = WaitForMultipleObjects(2, wait_handles, FALSE, INFINITE);
-    if (wait_result == WAIT_OBJECT_0 + 1) return TAPTUN_ERROR_CLOSED;
-    if (wait_result != WAIT_OBJECT_0 ||
-        !GetOverlappedResult(device->tap_handle, &overlapped, &bytes_written, FALSE)) {
-        return GetLastError() == ERROR_OPERATION_ABORTED ? TAPTUN_ERROR_CLOSED : TAPTUN_ERROR;
-    }
-    return (int)bytes_written;
+    return finish_tap_io(device, &overlapped);
 }
 
 static int write_wintun_packet(TapTunDevice* device, const unsigned char* data, int data_size) {
@@ -979,59 +1000,67 @@ int TapTun_Read(TapTunDevice* device, unsigned char* buffer, int buffer_size) {
     return result;
 }
 
-int TapTun_Write(TapTunDevice* device, const unsigned char* data, int data_size) {
-    if (!device || !data || data_size <= 0 ||
-        (device->mode == TAPTUN_MODE_TUN && data_size > TAPTUN_MAX_IP_PACKET_SIZE) ||
-        (device->mode == TAPTUN_MODE_TAP && data_size > TAPTUN_MAX_ETHERNET_FRAME_SIZE)) {
-        return TAPTUN_ERROR_INVALID_ARGUMENT;
-    }
-    int result = begin_operation(device, 0);
-    if (result != TAPTUN_OK) return result;
+/* Writes one packet. The caller must already hold an operation reference so a
+   batch keeps the device alive across every packet it contains. */
+static int write_packet(TapTunDevice* device, const unsigned char* data, int data_size) {
+    if (operation_is_closing(device)) return TAPTUN_ERROR_CLOSED;
     if (device->backend == WINDOWS_BACKEND_TAP_WINDOWS6) {
         EnterCriticalSection(&device->write_lock);
-        result = write_tap_windows6(device, data, data_size);
+        int result = operation_is_closing(device) ? TAPTUN_ERROR_CLOSED
+            : write_tap_windows6(device, data, data_size);
         LeaveCriticalSection(&device->write_lock);
-        end_operation(device, 0);
         return result;
     }
 
     if (!device->emulates_tap) {
-        if (data_size > WINTUN_MAX_IP_PACKET_SIZE) {
-            result = TAPTUN_ERROR_INVALID_ARGUMENT;
-        } else if (device->uses_callbacks) {
-            result = device->callbacks.write(device->callbacks.context, data, data_size);
-        } else {
-            result = write_wintun_packet(device, data, data_size);
+        if (device->uses_callbacks) {
+            return device->callbacks.write(device->callbacks.context, data, data_size);
         }
-    } else {
-        unsigned char synthetic[TAPTUN_SYNTHETIC_FRAME_SIZE];
-        int output_size = 0;
-        EnterCriticalSection(&device->write_lock);
-        int action = taptun_tun2tap_decapsulate(
-            &device->tun2tap,
-            data,
-            data_size,
-            device->write_packet,
-            TAPTUN_MAX_IP_PACKET_SIZE,
-            synthetic,
-            sizeof(synthetic),
-            &output_size);
-        if (action == TAPTUN_TUN2TAP_PACKET) {
-            result = device->uses_callbacks
-                ? device->callbacks.write(device->callbacks.context, device->write_packet, output_size)
-                : write_wintun_packet(device, device->write_packet, output_size);
-            if (result == output_size) result = data_size;
-        } else if (action == TAPTUN_TUN2TAP_SYNTHETIC) {
-            result = enqueue_synthetic_frame(device, synthetic, output_size);
-            if (result == TAPTUN_OK) result = data_size;
-        } else if (action == TAPTUN_TUN2TAP_DROP) {
-            result = TAPTUN_ERROR_UNSUPPORTED;
-        } else {
-            result = action;
-        }
-        LeaveCriticalSection(&device->write_lock);
+        return write_wintun_packet(device, data, data_size);
     }
 
+    unsigned char synthetic[TAPTUN_SYNTHETIC_FRAME_SIZE];
+    int output_size = 0;
+    EnterCriticalSection(&device->write_lock);
+    if (operation_is_closing(device)) {
+        LeaveCriticalSection(&device->write_lock);
+        return TAPTUN_ERROR_CLOSED;
+    }
+    int action = taptun_tun2tap_decapsulate(
+        &device->tun2tap,
+        data,
+        data_size,
+        device->write_packet,
+        TAPTUN_MAX_IP_PACKET_SIZE,
+        synthetic,
+        sizeof(synthetic),
+        &output_size);
+    int result;
+    if (action == TAPTUN_TUN2TAP_PACKET) {
+        result = device->uses_callbacks
+            ? device->callbacks.write(device->callbacks.context, device->write_packet, output_size)
+            : write_wintun_packet(device, device->write_packet, output_size);
+        if (result == output_size) result = data_size;
+    } else if (action == TAPTUN_TUN2TAP_SYNTHETIC) {
+        result = enqueue_synthetic_frame(device, synthetic, output_size);
+        if (result == TAPTUN_OK) result = data_size;
+    } else if (action == TAPTUN_TUN2TAP_DROP) {
+        result = TAPTUN_ERROR_UNSUPPORTED;
+    } else {
+        result = action;
+    }
+    LeaveCriticalSection(&device->write_lock);
+    return result;
+}
+
+int TapTun_Write(TapTunDevice* device, const unsigned char* data, int data_size) {
+    if (!device || !data || data_size <= 0 ||
+        !taptun_valid_packet_size(device->mode, (uint32_t)data_size)) {
+        return TAPTUN_ERROR_INVALID_ARGUMENT;
+    }
+    int result = begin_operation(device, 0);
+    if (result != TAPTUN_OK) return result;
+    result = write_packet(device, data, data_size);
     end_operation(device, 0);
     return result;
 }
@@ -1060,27 +1089,24 @@ int TapTun_WriteBatch(
     TapTunDevice* device,
     const TapTunBuffer* buffers,
     uint32_t buffer_count) {
-    if (!device || !buffers || buffer_count == 0 || buffer_count > INT_MAX) {
+    if (!device || !taptun_valid_write_batch(device->mode, buffers, buffer_count)) {
         return TAPTUN_ERROR_INVALID_ARGUMENT;
     }
-    for (uint32_t index = 0; index < buffer_count; ++index) {
-        if (!buffers[index].data || buffers[index].size == 0 ||
-            buffers[index].size > INT_MAX) {
-            return TAPTUN_ERROR_INVALID_ARGUMENT;
-        }
-    }
+    int result = begin_operation(device, 0);
+    if (result != TAPTUN_OK) return result;
     uint32_t completed = 0;
-    for (; completed < buffer_count; ++completed) {
-        int result = TapTun_Write(device, buffers[completed].data, (int)buffers[completed].size);
-        if (result != (int)buffers[completed].size) {
-            return completed != 0 ? (int)completed : result;
-        }
+    while (completed < buffer_count) {
+        result = write_packet(device, buffers[completed].data, (int)buffers[completed].size);
+        if (result != (int)buffers[completed].size) break;
+        ++completed;
     }
-    return (int)completed;
+    end_operation(device, 0);
+    return completed != 0 ? (int)completed : result;
 }
 
 int TapTun_AcquireReceive(TapTunDevice* device, TapTunPacket* packet) {
     if (!device || !packet) return TAPTUN_ERROR_INVALID_ARGUMENT;
+    if (operation_is_closing(device)) return TAPTUN_ERROR_CLOSED;
     if ((TapTun_GetCapabilities(device) & TAPTUN_CAP_ZERO_COPY_RECEIVE) == 0) {
         return TAPTUN_ERROR_UNSUPPORTED;
     }
@@ -1103,6 +1129,8 @@ int TapTun_AcquireReceive(TapTunDevice* device, TapTunPacket* packet) {
             packet->data = native_packet;
             packet->size = packet_size;
             packet->backend_token = &device->receive_token;
+            --device->active_operations;
+            WakeAllConditionVariable(&device->state_condition);
             LeaveCriticalSection(&device->state_lock);
             return TAPTUN_OK;
         }
@@ -1148,7 +1176,7 @@ int TapTun_ReleaseReceive(TapTunDevice* device, TapTunPacket* packet) {
     BYTE* native_packet = device->acquired_receive_packet;
     device->release_receive_packet(device->session, native_packet);
     device->acquired_receive_packet = NULL;
-    end_operation_locked(device, 1);
+    device->active_read = 0;
     LeaveCriticalSection(&device->state_lock);
 
     packet->data = NULL;
@@ -1158,9 +1186,10 @@ int TapTun_ReleaseReceive(TapTunDevice* device, TapTunPacket* packet) {
 }
 
 int TapTun_AcquireSend(TapTunDevice* device, uint32_t packet_size, TapTunPacket* packet) {
-    if (!device || !packet || packet_size == 0 || packet_size > WINTUN_MAX_IP_PACKET_SIZE) {
+    if (!device || !packet || !taptun_valid_packet_size(device->mode, packet_size)) {
         return TAPTUN_ERROR_INVALID_ARGUMENT;
     }
+    if (operation_is_closing(device)) return TAPTUN_ERROR_CLOSED;
     if ((TapTun_GetCapabilities(device) & TAPTUN_CAP_ZERO_COPY_SEND) == 0) {
         return TAPTUN_ERROR_UNSUPPORTED;
     }
@@ -1182,7 +1211,6 @@ int TapTun_AcquireSend(TapTunDevice* device, uint32_t packet_size, TapTunPacket*
             ? TAPTUN_ERROR_CLOSED
             : error == ERROR_BUFFER_OVERFLOW ? TAPTUN_ERROR_BUSY : TAPTUN_ERROR;
     }
-    ++device->active_operations;
     device->active_send_lease = 1;
     device->acquired_send_packet = native_packet;
     packet->data = native_packet;
@@ -1194,11 +1222,16 @@ int TapTun_AcquireSend(TapTunDevice* device, uint32_t packet_size, TapTunPacket*
 
 int TapTun_CommitSend(TapTunDevice* device, TapTunPacket* packet) {
     if (!device || !packet) return TAPTUN_ERROR_INVALID_ARGUMENT;
+    if (operation_is_closing(device)) return TAPTUN_ERROR_CLOSED;
     if ((TapTun_GetCapabilities(device) & TAPTUN_CAP_ZERO_COPY_SEND) == 0) {
         return TAPTUN_ERROR_UNSUPPORTED;
     }
 
     EnterCriticalSection(&device->state_lock);
+    if (device->closing) {
+        LeaveCriticalSection(&device->state_lock);
+        return TAPTUN_ERROR_CLOSED;
+    }
     if (packet->backend_token != &device->send_token ||
         packet->data != device->acquired_send_packet ||
         !device->active_send_lease) {
@@ -1209,7 +1242,6 @@ int TapTun_CommitSend(TapTunDevice* device, TapTunPacket* packet) {
     device->send_packet(device->session, native_packet);
     device->acquired_send_packet = NULL;
     device->active_send_lease = 0;
-    end_operation_locked(device, 0);
     LeaveCriticalSection(&device->state_lock);
 
     packet->data = NULL;
@@ -1218,43 +1250,41 @@ int TapTun_CommitSend(TapTunDevice* device, TapTunPacket* packet) {
     return TAPTUN_OK;
 }
 
-void TapTun_Close(TapTunDevice* device) {
-    if (!device) return;
-
+int TapTun_Shutdown(TapTunDevice* device) {
+    if (!device) return TAPTUN_ERROR_INVALID_ARGUMENT;
     EnterCriticalSection(&device->state_lock);
+    if (device->closing) {
+        while (!device->shutdown_complete) {
+            SleepConditionVariableCS(&device->state_condition, &device->state_lock, INFINITE);
+        }
+        LeaveCriticalSection(&device->state_lock);
+        return TAPTUN_OK;
+    }
     device->closing = 1;
     SetEvent(device->close_event);
     SetEvent(device->wake_event);
-    // Closing invalidates leases; Wintun session teardown reclaims an
-    // allocated send packet because Wintun has no separate cancel operation.
-    BYTE* acquired_receive_packet = device->acquired_receive_packet;
-    if (acquired_receive_packet) {
-        device->acquired_receive_packet = NULL;
-        device->active_read = 0;
-        --device->active_operations;
-    }
-    if (device->active_send_lease) {
-        device->active_send_lease = 0;
-        device->acquired_send_packet = NULL;
-        --device->active_operations;
-    }
-    WakeAllConditionVariable(&device->state_condition);
     LeaveCriticalSection(&device->state_lock);
-
-    if (acquired_receive_packet && device->backend == WINDOWS_BACKEND_WINTUN) {
-        device->release_receive_packet(device->session, acquired_receive_packet);
-    }
-    if (device->uses_callbacks) device->callbacks.close(device->callbacks.context);
+    if (device->uses_callbacks) device->callbacks.cancel(device->callbacks.context);
     if (device->backend == WINDOWS_BACKEND_TAP_WINDOWS6) {
-        CancelIoEx(device->tap_handle, NULL);
+        (void)CancelIoEx(device->tap_handle, NULL);
     }
-
     EnterCriticalSection(&device->state_lock);
     while (device->active_operations != 0) {
         SleepConditionVariableCS(&device->state_condition, &device->state_lock, INFINITE);
     }
+    device->shutdown_complete = 1;
+    WakeAllConditionVariable(&device->state_condition);
     LeaveCriticalSection(&device->state_lock);
+    return TAPTUN_OK;
+}
 
+void TapTun_Close(TapTunDevice* device) {
+    if (!device) return;
+    (void)TapTun_Shutdown(device);
+    if (device->uses_callbacks) device->callbacks.close(device->callbacks.context);
+    if (device->acquired_receive_packet) {
+        device->release_receive_packet(device->session, device->acquired_receive_packet);
+    }
     if (device->backend == WINDOWS_BACKEND_WINTUN) {
         device->end_session(device->session);
         device->close_adapter(device->adapter);

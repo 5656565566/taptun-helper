@@ -13,16 +13,21 @@
 
 #include "../include/taptun_api.h"
 
-static void* delayed_close_thread(void* argument) {
+static void* delayed_shutdown_thread(void* argument) {
     struct timespec delay = { 0, 10000000 };
     nanosleep(&delay, NULL);
-    TapTun_Close((TapTunDevice*)argument);
+    (void)TapTun_Shutdown((TapTunDevice*)argument);
     return NULL;
 }
 
 static int test_external_handle(void) {
     int sockets[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) != 0) return 1;
+    if (fcntl(sockets[0], F_SETFL, fcntl(sockets[0], F_GETFL) | O_NONBLOCK) < 0) {
+        close(sockets[0]);
+        close(sockets[1]);
+        return 1;
+    }
 
     TapTunHandleOptions handle_options;
     memset(&handle_options, 0, sizeof(handle_options));
@@ -69,13 +74,14 @@ static int test_external_handle(void) {
     }
 
     pthread_t thread;
-    if (pthread_create(&thread, NULL, delayed_close_thread, device) != 0) {
+    if (pthread_create(&thread, NULL, delayed_shutdown_thread, device) != 0) {
         TapTun_Close(device);
         close(sockets[1]);
         return 1;
     }
     int close_result = TapTun_Read(device, buffer, sizeof(buffer));
     pthread_join(thread, NULL);
+    TapTun_Close(device);
     close(sockets[1]);
     return close_result == TAPTUN_ERROR_CLOSED ? 0 : 1;
 }
@@ -566,10 +572,18 @@ static int test_native_performance(void) {
         result = TapTun_AcquireSend(device, 1400, &final_packet);
         if (result == TAPTUN_ERROR_BUSY) sched_yield();
     } while (result == TAPTUN_ERROR_BUSY);
+    if (result == TAPTUN_OK) {
+        result = TapTun_Shutdown(device);
+        if (result == TAPTUN_OK) {
+            memset(final_packet.data, 0, final_packet.size);
+            if (TapTun_CommitSend(device, &final_packet) != TAPTUN_ERROR_CLOSED ||
+                TapTun_Shutdown(device) != TAPTUN_OK) result = TAPTUN_ERROR;
+        }
+    }
     TapTun_Close(device);
     if (result != TAPTUN_OK) {
         fprintf(stderr,
-            "Final AcquireSend failed: result=%d system_error=%u.\n",
+            "Final send lease/shutdown failed: result=%d system_error=%u.\n",
             result,
             TapTun_GetLastSystemError());
         return 1;
@@ -581,6 +595,11 @@ static int test_native_performance(void) {
 static int test_emulated_tap(void) {
     int sockets[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) != 0) return 1;
+    if (fcntl(sockets[0], F_SETFL, fcntl(sockets[0], F_GETFL) | O_NONBLOCK) < 0) {
+        close(sockets[0]);
+        close(sockets[1]);
+        return 1;
+    }
     TapTunHandleOptions options;
     memset(&options, 0, sizeof(options));
     options.handle = sockets[0];

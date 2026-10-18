@@ -17,7 +17,8 @@ TapTunLinuxUring* taptun_linux_uring_create(
 int taptun_linux_uring_acquire(
     TapTunLinuxUring* ring,
     uint32_t packet_size,
-    TapTunPacket* packet);
+    TapTunPacket* packet,
+    int stop_fd);
 
 int taptun_linux_uring_validate_acquired(
     const TapTunLinuxUring* ring,
@@ -29,6 +30,7 @@ int taptun_linux_uring_commit(
     TapTunPacket* packet);
 
 void taptun_linux_uring_cancel_acquired(TapTunLinuxUring* ring);
+int taptun_linux_uring_shutdown(TapTunLinuxUring* ring);
 void taptun_linux_uring_destroy(TapTunLinuxUring* ring);
 
 #endif

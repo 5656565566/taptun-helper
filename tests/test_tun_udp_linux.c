@@ -43,7 +43,7 @@ void* udp_to_tap_thread(void* arg) {
     while (1) {
         bytes_received = recvfrom(args->udp_socket_fd, buffer, sizeof(buffer), 0, NULL, NULL);
         if (bytes_received > 0) {
-            TapTun_Write(args->tun_device, buffer, bytes_received);
+            if (TapTun_Write(args->tun_device, buffer, bytes_received) < 0) break;
         } else {
             perror("[THREAD UDP->TUN] recvfrom failed");
             break;
@@ -114,8 +114,8 @@ int main(int argc, char* argv[]) {
     getchar();
 
     printf("Shutting down...\n");
-    pthread_cancel(tid1);
-    pthread_cancel(tid2);
+    (void)TapTun_Shutdown(tun);
+    shutdown(udp_sock_fd, SHUT_RDWR);
     pthread_join(tid1, NULL);
     pthread_join(tid2, NULL);
     close(udp_sock_fd);

@@ -39,6 +39,9 @@ ifeq ($(TARGET),windows)
 	TEST_EXE = bin/test_windows.exe
 	TEST_SRC = tests/test_windows.c
 	WINDOWS_IP_TEST_EXE = bin/test_windows_ip.exe
+	NATIVE_SHUTDOWN_TEST_EXE = bin/test_windows_shutdown.exe
+	NATIVE_SHUTDOWN_TEST_SRC = tests/test_windows_shutdown.c $(COMMON_SRC)
+	NATIVE_SHUTDOWN_LDFLAGS = -liphlpapi -lws2_32 -ladvapi32
 	BENCHMARK_EXE = bin/benchmark_windows.exe
 	BENCHMARK_SRC = benchmarks/benchmark_windows.c
 	TEST_LDFLAGS_PLATFORM = -municode
@@ -54,6 +57,10 @@ else ifeq ($(TARGET),linux)
 	BENCHMARK_SRC = benchmarks/benchmark_posix.c
 	BENCHMARK_LDFLAGS_PLATFORM = -pthread -Wl,-rpath,'$$ORIGIN'
 	OFFLOAD_TEST_EXE = bin/test_linux_offload
+	URING_SHUTDOWN_TEST_EXE = bin/test_linux_uring_shutdown
+	NATIVE_SHUTDOWN_TEST_EXE = bin/test_posix_shutdown
+	NATIVE_SHUTDOWN_TEST_SRC = tests/test_posix_shutdown.c $(filter-out $(SRC_DIR)/taptun_linux.c,$(SRC))
+	NATIVE_SHUTDOWN_CFLAGS = -DTAPTUN_TEST_LINUX
 else ifeq ($(TARGET),macos)
 	TARGET_LIB = bin/libtaptun.dylib
 	SRC = $(SRC_DIR)/taptun_apple.c $(COMMON_SRC)
@@ -76,6 +83,8 @@ else ifeq ($(TARGET),posix)
 	BENCHMARK_EXE = bin/benchmark_posix
 	BENCHMARK_SRC = benchmarks/benchmark_posix.c
 	BENCHMARK_LDFLAGS_PLATFORM = -pthread -Wl,-rpath,'$$ORIGIN'
+	NATIVE_SHUTDOWN_TEST_EXE = bin/test_posix_shutdown
+	NATIVE_SHUTDOWN_TEST_SRC = tests/test_posix_shutdown.c $(COMMON_SRC)
 else
 	$(error Unsupported target: $(TARGET))
 endif
@@ -83,6 +92,7 @@ endif
 OBJECTS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRC))
 CFLAGS = -std=c11 -I$(INCLUDE_DIR) -Wall -Wextra $(CFLAGS_BUILD) $(CFLAGS_PLATFORM)
 PROTOCOL_TEST_EXE = bin/test_tun2tap$(if $(filter windows,$(TARGET)),.exe,)
+LIFECYCLE_TEST_EXE = bin/test_lifecycle$(if $(filter windows,$(TARGET)),.exe,)
 GENERATED_BINARIES = \
 	bin/taptun.dll \
 	bin/libtaptun.dll.a \
@@ -90,12 +100,17 @@ GENERATED_BINARIES = \
 	bin/libtaptun.dylib \
 	bin/test_windows.exe \
 	bin/test_windows_ip.exe \
+	bin/test_windows_shutdown.exe \
+	bin/test_posix_shutdown \
+	bin/test_linux_uring_shutdown \
 	bin/test_linux \
 	bin/test_posix \
 	bin/test_macos \
 	bin/test_linux_offload \
 	bin/test_tun2tap \
 	bin/test_tun2tap.exe \
+	bin/test_lifecycle \
+	bin/test_lifecycle.exe \
 	bin/benchmark_windows.exe \
 	bin/benchmark_linux \
 	bin/benchmark_macos \
@@ -109,12 +124,25 @@ $(TARGET_LIB): $(OBJECTS) FORCE
 	$(CC) -o $@ $(OBJECTS) $(LDFLAGS_PLATFORM)
 	@echo "==> Successfully created $@"
 
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c $(wildcard include/*.h src/*.h)
 	@mkdir -p $(BUILD_DIR)
 	@echo "==> Compiling $< for $(TARGET) ($(BUILD))..."
 	$(CC) $(CFLAGS) -DTUNTAP_EXPORTS -c $< -o $@
 
-test: $(TEST_EXE) $(PROTOCOL_TEST_EXE) $(OFFLOAD_TEST_EXE) $(WINDOWS_IP_TEST_EXE)
+test: $(TEST_EXE) $(PROTOCOL_TEST_EXE) $(LIFECYCLE_TEST_EXE) $(OFFLOAD_TEST_EXE) $(WINDOWS_IP_TEST_EXE) $(NATIVE_SHUTDOWN_TEST_EXE) $(URING_SHUTDOWN_TEST_EXE)
+
+$(LIFECYCLE_TEST_EXE): $(TARGET_LIB) tests/test_lifecycle.c FORCE
+	$(CC) $(CFLAGS) tests/test_lifecycle.c -o $@ -Lbin -ltaptun $(filter-out -municode,$(TEST_LDFLAGS_PLATFORM))
+
+ifneq ($(NATIVE_SHUTDOWN_TEST_EXE),)
+$(NATIVE_SHUTDOWN_TEST_EXE): $(NATIVE_SHUTDOWN_TEST_SRC) $(wildcard src/*.h include/*.h) FORCE
+	$(CC) $(CFLAGS) -DTUNTAP_EXPORTS $(NATIVE_SHUTDOWN_CFLAGS) $(NATIVE_SHUTDOWN_TEST_SRC) -o $@ $(NATIVE_SHUTDOWN_LDFLAGS)
+endif
+
+ifneq ($(URING_SHUTDOWN_TEST_EXE),)
+$(URING_SHUTDOWN_TEST_EXE): tests/test_linux_uring_shutdown.c $(SRC_DIR)/linux_uring.c FORCE
+	$(CC) $(CFLAGS) -DTUNTAP_EXPORTS tests/test_linux_uring_shutdown.c -o $@
+endif
 
 $(TEST_EXE): $(TARGET_LIB) $(TEST_SRC) FORCE
 	@echo "==> Linking test executable for $(TARGET)..."

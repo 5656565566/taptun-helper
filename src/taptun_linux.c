@@ -2,6 +2,8 @@
 #include "linux_offload.h"
 #include "linux_uring.h"
 #include "tun2tap.h"
+#include "taptun_internal.h"
+#include "posix_io.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -30,7 +32,8 @@ struct TapTunDevice {
     int owns_fd;
     int uses_callbacks;
     TapTunCallbackOptions callbacks;
-    int cancel_pipe[2];
+    int wake_pipe[2];
+    int stop_pipe[2];
     unsigned int if_index;
     char if_name[IFNAMSIZ];
     TapTunMode mode;
@@ -50,6 +53,9 @@ struct TapTunDevice {
     int active_read;
     int active_send_lease;
     int closing;
+    int shutdown_complete;
+    int shutdown_result;
+    int shutdown_error;
     TapTunLinuxUring* send_ring;
     int vnet_hdr;
     unsigned char* offload_read_buffer;
@@ -81,6 +87,13 @@ static int begin_operation(TapTunDevice* device) {
     ++device->active_operations;
     pthread_mutex_unlock(&device->state_lock);
     return TAPTUN_OK;
+}
+
+static int operation_is_closing(TapTunDevice* device) {
+    pthread_mutex_lock(&device->state_lock);
+    int closing = device->closing;
+    pthread_mutex_unlock(&device->state_lock);
+    return closing;
 }
 
 static void end_operation(TapTunDevice* device) {
@@ -130,7 +143,7 @@ static TapTunDevice* allocate_device(
     if (!device) return NULL;
 
     device->queue_fds = (int*)malloc(sizeof(int) * queue_count);
-    device->read_poll_fds = (struct pollfd*)calloc(queue_count + 1, sizeof(struct pollfd));
+    device->read_poll_fds = (struct pollfd*)calloc(queue_count + 2, sizeof(struct pollfd));
     if (!device->queue_fds || !device->read_poll_fds) {
         free(device->queue_fds);
         free(device->read_poll_fds);
@@ -140,8 +153,8 @@ static TapTunDevice* allocate_device(
     memcpy(device->queue_fds, queue_fds, sizeof(int) * queue_count);
     device->queue_count = queue_count;
     device->owns_fd = owns_fd;
-    device->cancel_pipe[0] = -1;
-    device->cancel_pipe[1] = -1;
+    device->wake_pipe[0] = -1;
+    device->wake_pipe[1] = -1;
     device->if_index = if_index;
     device->mode = mode;
     device->backend_mode = backend_mode;
@@ -183,7 +196,7 @@ static TapTunDevice* allocate_device(
             if_index);
     }
 
-    if (pipe(device->cancel_pipe) != 0) {
+    if (taptun_make_pipes(device->wake_pipe, device->stop_pipe) != 0) {
         free(device->read_packet);
         free(device->write_packet);
         free(device->offload_read_buffer);
@@ -194,8 +207,7 @@ static TapTunDevice* allocate_device(
         return NULL;
     }
     if (pthread_mutex_init(&device->state_lock, NULL) != 0) {
-        close(device->cancel_pipe[0]);
-        close(device->cancel_pipe[1]);
+        taptun_close_pipes(device->wake_pipe, device->stop_pipe);
         free(device->read_packet);
         free(device->write_packet);
         free(device->offload_read_buffer);
@@ -207,8 +219,7 @@ static TapTunDevice* allocate_device(
     }
     if (pthread_mutex_init(&device->write_lock, NULL) != 0) {
         pthread_mutex_destroy(&device->state_lock);
-        close(device->cancel_pipe[0]);
-        close(device->cancel_pipe[1]);
+        taptun_close_pipes(device->wake_pipe, device->stop_pipe);
         free(device->read_packet);
         free(device->write_packet);
         free(device->offload_read_buffer);
@@ -221,8 +232,7 @@ static TapTunDevice* allocate_device(
     if (pthread_cond_init(&device->state_condition, NULL) != 0) {
         pthread_mutex_destroy(&device->write_lock);
         pthread_mutex_destroy(&device->state_lock);
-        close(device->cancel_pipe[0]);
-        close(device->cancel_pipe[1]);
+        taptun_close_pipes(device->wake_pipe, device->stop_pipe);
         free(device->read_packet);
         free(device->write_packet);
         free(device->offload_read_buffer);
@@ -256,7 +266,7 @@ static int open_native_queues(
     if (!queue_set->fds) return TAPTUN_ERROR;
 
     for (uint32_t index = 0; index < desired_count; ++index) {
-        int fd = open("/dev/net/tun", O_RDWR | O_CLOEXEC);
+        int fd = open("/dev/net/tun", O_RDWR | O_CLOEXEC | O_NONBLOCK);
         if (fd < 0) {
             if (require_exact_count || queue_set->count == 0) {
                 int native_error = errno;
@@ -501,6 +511,7 @@ TapTunDevice* TapTun_OpenFromHandle(const TapTunHandleOptions* options) {
         errno = EINVAL;
         return NULL;
     }
+    if (taptun_nonblocking((int)options->handle) != 0) return NULL;
     int fd = (int)options->handle;
     return allocate_device(
         &fd,
@@ -516,7 +527,10 @@ TapTunDevice* TapTun_OpenFromHandle(const TapTunHandleOptions* options) {
 }
 
 TapTunDevice* TapTun_OpenFromCallbacks(const TapTunCallbackOptions* options) {
-    if (!options || !options->read || !options->write || !options->close) return NULL;
+    if (!options || !options->read || !options->write || !options->cancel || !options->close) {
+        errno = EINVAL;
+        return NULL;
+    }
     if ((options->backend_mode != TAPTUN_MODE_TUN && options->backend_mode != TAPTUN_MODE_TAP) ||
         (options->mode != TAPTUN_MODE_TUN && options->mode != TAPTUN_MODE_TAP) ||
         (options->mode == TAPTUN_MODE_TUN && options->backend_mode != TAPTUN_MODE_TUN)) {
@@ -604,7 +618,7 @@ uint32_t TapTun_GetCapabilities(const TapTunDevice* device) {
 
 int TapTun_AcquireReceive(TapTunDevice* device, TapTunPacket* packet) {
     if (!device || !packet) return TAPTUN_ERROR_INVALID_ARGUMENT;
-    return TAPTUN_ERROR_UNSUPPORTED;
+    return operation_is_closing(device) ? TAPTUN_ERROR_CLOSED : TAPTUN_ERROR_UNSUPPORTED;
 }
 
 int TapTun_ReleaseReceive(TapTunDevice* device, TapTunPacket* packet) {
@@ -690,52 +704,41 @@ static uint32_t select_write_queue(
 }
 
 int TapTun_AcquireSend(TapTunDevice* device, uint32_t packet_size, TapTunPacket* packet) {
-    if (!device || !packet || packet_size == 0 ||
-        (device->mode == TAPTUN_MODE_TUN && packet_size > TAPTUN_MAX_IP_PACKET_SIZE) ||
-        (device->mode == TAPTUN_MODE_TAP && packet_size > TAPTUN_MAX_ETHERNET_FRAME_SIZE)) {
+    if (!device || !packet || !taptun_valid_packet_size(device->mode, packet_size)) {
         return TAPTUN_ERROR_INVALID_ARGUMENT;
     }
-    if (!device->send_ring) return TAPTUN_ERROR_UNSUPPORTED;
-
-    pthread_mutex_lock(&device->state_lock);
-    if (device->closing) {
-        pthread_mutex_unlock(&device->state_lock);
-        return TAPTUN_ERROR_CLOSED;
+    int result = begin_operation(device);
+    if (result != TAPTUN_OK) return result;
+    pthread_mutex_lock(&device->write_lock);
+    if (operation_is_closing(device)) result = TAPTUN_ERROR_CLOSED;
+    else if (!device->send_ring) result = TAPTUN_ERROR_UNSUPPORTED;
+    else if (device->active_send_lease) result = TAPTUN_ERROR_BUSY;
+    else {
+        result = taptun_linux_uring_acquire(device->send_ring, packet_size, packet, device->stop_pipe[0]);
+        if (result == TAPTUN_OK) device->active_send_lease = 1;
     }
-    if (device->active_send_lease) {
-        pthread_mutex_unlock(&device->state_lock);
-        return TAPTUN_ERROR_BUSY;
-    }
-    int result = taptun_linux_uring_acquire(device->send_ring, packet_size, packet);
-    if (result == TAPTUN_OK) {
-        device->active_send_lease = 1;
-        ++device->active_operations;
-    }
-    pthread_mutex_unlock(&device->state_lock);
+    pthread_mutex_unlock(&device->write_lock);
+    end_operation(device);
     return result;
 }
 
 int TapTun_CommitSend(TapTunDevice* device, TapTunPacket* packet) {
     if (!device || !packet) return TAPTUN_ERROR_INVALID_ARGUMENT;
-    if (!device->send_ring) return TAPTUN_ERROR_UNSUPPORTED;
-
-    pthread_mutex_lock(&device->state_lock);
-    if (!device->active_send_lease) {
-        pthread_mutex_unlock(&device->state_lock);
-        return TAPTUN_ERROR_INVALID_ARGUMENT;
+    int result = begin_operation(device);
+    if (result != TAPTUN_OK) return result;
+    pthread_mutex_lock(&device->write_lock);
+    if (operation_is_closing(device)) result = TAPTUN_ERROR_CLOSED;
+    else if (!device->send_ring) result = TAPTUN_ERROR_UNSUPPORTED;
+    else if (!device->active_send_lease) result = TAPTUN_ERROR_INVALID_ARGUMENT;
+    else if (taptun_linux_uring_validate_acquired(device->send_ring, packet) != TAPTUN_OK) {
+        result = TAPTUN_ERROR_INVALID_ARGUMENT;
+    } else {
+        uint32_t queue_index = select_write_queue(device, packet->data, packet->size);
+        result = taptun_linux_uring_commit(device->send_ring, queue_index, packet);
+        if (result == TAPTUN_OK || result == TAPTUN_ERROR) device->active_send_lease = 0;
     }
-    if (taptun_linux_uring_validate_acquired(device->send_ring, packet) != TAPTUN_OK) {
-        pthread_mutex_unlock(&device->state_lock);
-        return TAPTUN_ERROR_INVALID_ARGUMENT;
-    }
-    uint32_t queue_index = select_write_queue(device, packet->data, packet->size);
-    int result = taptun_linux_uring_commit(device->send_ring, queue_index, packet);
-    if (result == TAPTUN_OK || result == TAPTUN_ERROR) {
-        device->active_send_lease = 0;
-        --device->active_operations;
-        pthread_cond_broadcast(&device->state_condition);
-    }
-    pthread_mutex_unlock(&device->state_lock);
+    pthread_mutex_unlock(&device->write_lock);
+    end_operation(device);
     return result;
 }
 
@@ -861,11 +864,10 @@ static int enqueue_synthetic_frame(
     ++device->synthetic_count;
     pthread_mutex_unlock(&device->state_lock);
 
-    // The same pipe wakes a blocked read for queued protocol replies and close.
     if (device->uses_callbacks) {
         device->callbacks.interrupt_read(device->callbacks.context);
     } else {
-        (void)write(device->cancel_pipe[1], "w", 1);
+        taptun_signal(device->wake_pipe[1]);
     }
     return TAPTUN_OK;
 }
@@ -879,20 +881,22 @@ static int read_backend_packet(
         return device->callbacks.read(device->callbacks.context, buffer, buffer_size);
     }
     ssize_t bytes_read = read(device->queue_fds[queue_index], buffer, (size_t)buffer_size);
-    return bytes_read >= 0 ? (int)bytes_read : TAPTUN_ERROR;
+    if (bytes_read >= 0) return (int)bytes_read;
+    return errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK
+        ? TAPTUN_ERROR_BUSY : TAPTUN_ERROR;
 }
 
 static int write_backend_packet(
     TapTunDevice* device,
     const unsigned char* data,
     int data_size) {
+    if (operation_is_closing(device)) return TAPTUN_ERROR_CLOSED;
     if (device->uses_callbacks) {
         return device->callbacks.write(device->callbacks.context, data, data_size);
     }
     uint32_t queue_index = select_write_queue(device, data, (uint32_t)data_size);
     if (!device->vnet_hdr) {
-        ssize_t bytes_written = write(device->queue_fds[queue_index], data, (size_t)data_size);
-        return bytes_written >= 0 ? (int)bytes_written : TAPTUN_ERROR;
+        return taptun_write(device->queue_fds[queue_index], data, data_size, device->stop_pipe[0]);
     }
 
     struct virtio_net_hdr header;
@@ -901,9 +905,10 @@ static int write_backend_packet(
         { &header, sizeof(header) },
         { (void*)data, (size_t)data_size }
     };
-    ssize_t bytes_written = writev(device->queue_fds[queue_index], vectors, 2);
+    int bytes_written = taptun_writev(device->queue_fds[queue_index], vectors, 2, device->stop_pipe[0]);
     if (bytes_written == (ssize_t)(sizeof(header) + (size_t)data_size)) return data_size;
-    if (bytes_written >= 0) errno = EIO;
+    if (bytes_written < 0) return bytes_written;
+    errno = EIO;
     return TAPTUN_ERROR;
 }
 
@@ -914,9 +919,10 @@ static int write_backend_offload_packet(
     const unsigned char* flow_packet,
     uint32_t flow_packet_size) {
     uint32_t queue_index = select_write_queue(device, flow_packet, flow_packet_size);
-    ssize_t bytes_written = write(device->queue_fds[queue_index], data, (size_t)data_size);
+    int bytes_written = taptun_write(device->queue_fds[queue_index], data, data_size, device->stop_pipe[0]);
     if (bytes_written == data_size) return TAPTUN_OK;
-    if (bytes_written >= 0) errno = EIO;
+    if (bytes_written < 0) return bytes_written;
+    errno = EIO;
     return TAPTUN_ERROR;
 }
 
@@ -926,17 +932,23 @@ static int wait_for_read_queue(TapTunDevice* device) {
         device->read_poll_fds[index].events = POLLIN;
         device->read_poll_fds[index].revents = 0;
     }
-    uint32_t cancel_index = device->queue_count;
-    device->read_poll_fds[cancel_index].fd = device->cancel_pipe[0];
-    device->read_poll_fds[cancel_index].events = POLLIN;
-    device->read_poll_fds[cancel_index].revents = 0;
+    uint32_t wake_index = device->queue_count;
+    device->read_poll_fds[wake_index].fd = device->wake_pipe[0];
+    device->read_poll_fds[wake_index].events = POLLIN;
+    device->read_poll_fds[wake_index].revents = 0;
+
+    uint32_t stop_index = wake_index + 1;
+    device->read_poll_fds[stop_index].fd = device->stop_pipe[0];
+    device->read_poll_fds[stop_index].events = POLLIN;
+    device->read_poll_fds[stop_index].revents = 0;
 
     int result;
     do {
-        result = poll(device->read_poll_fds, device->queue_count + 1, -1);
+        result = poll(device->read_poll_fds, device->queue_count + 2, -1);
     } while (result < 0 && errno == EINTR);
     if (result <= 0) return TAPTUN_ERROR;
-    if ((device->read_poll_fds[cancel_index].revents & POLLIN) != 0) return TAPTUN_ERROR_BUSY;
+    if (device->read_poll_fds[stop_index].revents != 0) return TAPTUN_ERROR_CLOSED;
+    if ((device->read_poll_fds[wake_index].revents & POLLIN) != 0) return TAPTUN_ERROR_BUSY;
 
     // Rotate the scan start so continuously busy queues cannot starve peers.
     for (uint32_t offset = 0; offset < device->queue_count; ++offset) {
@@ -970,7 +982,7 @@ static int read_single_packet(TapTunDevice* device, unsigned char* buffer, int b
             result = wait_for_read_queue(device);
             if (result == TAPTUN_ERROR_BUSY) {
                 char signal;
-                (void)read(device->cancel_pipe[0], &signal, 1);
+                (void)read(device->wake_pipe[0], &signal, 1);
                 pthread_mutex_lock(&device->state_lock);
                 closing = device->closing;
                 pthread_mutex_unlock(&device->state_lock);
@@ -980,17 +992,14 @@ static int read_single_packet(TapTunDevice* device, unsigned char* buffer, int b
                 }
                 continue;
             }
-            if (result < 0) {
-                result = TAPTUN_ERROR;
-                break;
-            }
+            if (result < 0) break;
             read_queue = (uint32_t)result;
         }
 
         unsigned char* target = device->emulates_tap ? device->read_packet : buffer;
         int capacity = device->emulates_tap ? TAPTUN_MAX_IP_PACKET_SIZE : buffer_size;
         result = read_backend_packet(device, read_queue, target, capacity);
-        if (device->emulates_tap && result == TAPTUN_ERROR_BUSY) continue;
+        if (result == TAPTUN_ERROR_BUSY && (!device->uses_callbacks || device->emulates_tap)) continue;
         if (result <= 0 || !device->emulates_tap) break;
         result = taptun_tun2tap_encapsulate(
             &device->tun2tap,
@@ -1064,19 +1073,17 @@ int TapTun_ReadBatch(
         result = wait_for_read_queue(device);
         if (result == TAPTUN_ERROR_BUSY) {
             char signal;
-            (void)read(device->cancel_pipe[0], &signal, 1);
+            (void)read(device->wake_pipe[0], &signal, 1);
             continue;
         }
-        if (result < 0) {
-            result = TAPTUN_ERROR;
-            break;
-        }
+        if (result < 0) break;
 
         ssize_t bytes_read = read(
             device->queue_fds[(uint32_t)result],
             device->offload_read_buffer,
             TAPTUN_VNET_BUFFER_SIZE);
         if (bytes_read < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
             result = TAPTUN_ERROR;
             break;
         }
@@ -1116,23 +1123,20 @@ int TapTun_Read(TapTunDevice* device, unsigned char* buffer, int buffer_size) {
     return result == 1 ? (int)packet.size : result;
 }
 
-int TapTun_Write(TapTunDevice* device, const unsigned char* data, int data_size) {
-    if (!device || !data || data_size <= 0 ||
-        (device->mode == TAPTUN_MODE_TUN && data_size > TAPTUN_MAX_IP_PACKET_SIZE) ||
-        (device->mode == TAPTUN_MODE_TAP && data_size > TAPTUN_MAX_ETHERNET_FRAME_SIZE)) {
-        return TAPTUN_ERROR_INVALID_ARGUMENT;
-    }
-    int result = begin_operation(device);
-    if (result != TAPTUN_OK) return result;
+/* Writes one packet. The caller must already hold an operation reference so a
+   batch keeps the device alive across every packet it contains. */
+static int write_packet(TapTunDevice* device, const unsigned char* data, int data_size) {
     if (!device->emulates_tap) {
-        result = write_backend_packet(device, data, data_size);
-        end_operation(device);
-        return result;
+        return write_backend_packet(device, data, data_size);
     }
 
     unsigned char synthetic[TAPTUN_SYNTHETIC_FRAME_SIZE];
     int output_size = 0;
     pthread_mutex_lock(&device->write_lock);
+    if (operation_is_closing(device)) {
+        pthread_mutex_unlock(&device->write_lock);
+        return TAPTUN_ERROR_CLOSED;
+    }
     int action = taptun_tun2tap_decapsulate(
         &device->tun2tap,
         data,
@@ -1142,6 +1146,7 @@ int TapTun_Write(TapTunDevice* device, const unsigned char* data, int data_size)
         synthetic,
         sizeof(synthetic),
         &output_size);
+    int result;
     if (action == TAPTUN_TUN2TAP_PACKET) {
         result = write_backend_packet(device, device->write_packet, output_size);
         if (result == output_size) result = data_size;
@@ -1154,6 +1159,17 @@ int TapTun_Write(TapTunDevice* device, const unsigned char* data, int data_size)
         result = action;
     }
     pthread_mutex_unlock(&device->write_lock);
+    return result;
+}
+
+int TapTun_Write(TapTunDevice* device, const unsigned char* data, int data_size) {
+    if (!device || !data || data_size <= 0 ||
+        !taptun_valid_packet_size(device->mode, (uint32_t)data_size)) {
+        return TAPTUN_ERROR_INVALID_ARGUMENT;
+    }
+    int result = begin_operation(device);
+    if (result != TAPTUN_OK) return result;
+    result = write_packet(device, data, data_size);
     end_operation(device);
     return result;
 }
@@ -1162,38 +1178,33 @@ int TapTun_WriteBatch(
     TapTunDevice* device,
     const TapTunBuffer* buffers,
     uint32_t buffer_count) {
-    if (!device || !buffers || buffer_count == 0 || buffer_count > INT_MAX) {
+    if (!device || !taptun_valid_write_batch(device->mode, buffers, buffer_count)) {
         return TAPTUN_ERROR_INVALID_ARGUMENT;
     }
-    uint32_t maximum_size = device->mode == TAPTUN_MODE_TUN
-        ? TAPTUN_MAX_IP_PACKET_SIZE
-        : TAPTUN_MAX_ETHERNET_FRAME_SIZE;
-    for (uint32_t index = 0; index < buffer_count; ++index) {
-        if (!buffers[index].data || buffers[index].size == 0 ||
-            buffers[index].size > maximum_size) {
-            return TAPTUN_ERROR_INVALID_ARGUMENT;
-        }
-    }
+    int result = begin_operation(device);
+    if (result != TAPTUN_OK) return result;
 
     if (!device->vnet_hdr) {
         uint32_t completed = 0;
-        for (; completed < buffer_count; ++completed) {
-            int result = TapTun_Write(
-                device,
-                buffers[completed].data,
-                (int)buffers[completed].size);
+        while (completed < buffer_count) {
+            result = write_packet(device, buffers[completed].data, (int)buffers[completed].size);
             if (result != (int)buffers[completed].size) {
+                end_operation(device);
                 return completed != 0 ? (int)completed : result;
             }
+            ++completed;
         }
+        end_operation(device);
         return (int)completed;
     }
 
-    int result = begin_operation(device);
-    if (result != TAPTUN_OK) return result;
     uint32_t completed = 0;
     pthread_mutex_lock(&device->write_lock);
     while (completed < buffer_count) {
+        if (operation_is_closing(device)) {
+            result = TAPTUN_ERROR_CLOSED;
+            break;
+        }
         uint32_t consumed = 1;
         int offload_size = taptun_linux_gro_coalesce(
             buffers + completed,
@@ -1229,38 +1240,52 @@ int TapTun_WriteBatch(
     return completed != 0 ? (int)completed : result;
 }
 
-void TapTun_Close(TapTunDevice* device) {
-    if (!device) return;
-
+int TapTun_Shutdown(TapTunDevice* device) {
+    if (!device) return TAPTUN_ERROR_INVALID_ARGUMENT;
     pthread_mutex_lock(&device->state_lock);
+    if (device->closing) {
+        while (!device->shutdown_complete) {
+            pthread_cond_wait(&device->state_condition, &device->state_lock);
+        }
+        int result = device->shutdown_result;
+        if (device->shutdown_error) errno = device->shutdown_error;
+        pthread_mutex_unlock(&device->state_lock);
+        return result;
+    }
     device->closing = 1;
-    if (device->active_send_lease) {
-        taptun_linux_uring_cancel_acquired(device->send_ring);
-        device->active_send_lease = 0;
-        --device->active_operations;
-    }
-    pthread_cond_broadcast(&device->state_condition);
     pthread_mutex_unlock(&device->state_lock);
-    if (device->uses_callbacks) {
-        device->callbacks.close(device->callbacks.context);
-    } else {
-        (void)write(device->cancel_pipe[1], "x", 1);
-    }
+    taptun_signal(device->stop_pipe[1]);
+    if (device->uses_callbacks) device->callbacks.cancel(device->callbacks.context);
 
     pthread_mutex_lock(&device->state_lock);
     while (device->active_operations != 0) {
         pthread_cond_wait(&device->state_condition, &device->state_lock);
     }
     pthread_mutex_unlock(&device->state_lock);
+    int result = TAPTUN_OK;
+    if (device->send_ring) result = taptun_linux_uring_shutdown(device->send_ring);
+    int error = result == TAPTUN_OK ? 0 : errno;
+    pthread_mutex_lock(&device->state_lock);
+    device->shutdown_result = result;
+    device->shutdown_error = error;
+    device->shutdown_complete = 1;
+    pthread_cond_broadcast(&device->state_condition);
+    pthread_mutex_unlock(&device->state_lock);
+    if (error) errno = error;
+    return result;
+}
 
+void TapTun_Close(TapTunDevice* device) {
+    if (!device) return;
+    (void)TapTun_Shutdown(device);
+    if (device->uses_callbacks) device->callbacks.close(device->callbacks.context);
     taptun_linux_uring_destroy(device->send_ring);
     if (device->owns_fd) {
         for (uint32_t index = 0; index < device->queue_count; ++index) {
             close(device->queue_fds[index]);
         }
     }
-    close(device->cancel_pipe[0]);
-    close(device->cancel_pipe[1]);
+    taptun_close_pipes(device->wake_pipe, device->stop_pipe);
     free(device->read_packet);
     free(device->write_packet);
     free(device->offload_read_buffer);

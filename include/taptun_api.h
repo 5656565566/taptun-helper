@@ -206,6 +206,15 @@ typedef int (*TapTunReadCallback)(void* context, unsigned char* buffer, int buff
 typedef int (*TapTunWriteCallback)(void* context, const unsigned char* data, int data_size);
 
 /**
+ * Permanently cancels pending and future read/write callbacks without freeing
+ * context or resources. Must be thread safe and return promptly. A callback
+ * racing with cancellation must observe the persistent cancelled state.
+ * 永久取消当前及后续读写回调，不释放上下文和资源；必须线程安全并及时返回。
+ * 与取消并发进入的回调必须观察持久的取消状态。
+ */
+typedef void (*TapTunCancelCallback)(void* context);
+
+/**
  * @brief Closes resources owned by a host callback backend
  *        关闭宿主回调后端拥有的资源
  */
@@ -225,13 +234,18 @@ typedef struct {
     void* context;
     TapTunReadCallback read;
     TapTunWriteCallback write;
-    // Must unblock a pending read callback when TapTun_Close is called
-    // 调用 TapTun_Close 时必须解除等待中的读取回调
+    // Required; called once by Shutdown before waiting for active calls
+    // 必需；Shutdown 等待活动调用退出前调用一次
+    TapTunCancelCallback cancel;
+    // Called once by final Close, after all active calls have returned
+    // 最终 Close 在全部活动调用返回后调用一次
     TapTunCloseCallback close;
     // Required for emulated TAP
     // Must make a pending read callback return
+    // May race with cancel; must not clear its persistent cancellation state
     // 模拟 TAP 模式必须提供此回调
     // 必须使等待中的读取回调返回
+    // 可与 cancel 并发执行，不能清除其持久取消状态
     TapTunInterruptReadCallback interrupt_read;
     const char* name;
     unsigned int if_index;
@@ -290,6 +304,8 @@ TAPTUN_API TapTunDevice* TapTun_OpenWithPerformance(
  *
  * TapTun_Close closes the handle only when take_ownership is nonzero
  * 仅当 take_ownership 非零时 TapTun_Close 才会关闭句柄
+ * POSIX handles must already have O_NONBLOCK set and keep it set until Close
+ * POSIX 句柄必须已设置 O_NONBLOCK，并保持到 Close
  *
  * @param options Host handle options
  *                宿主句柄配置
@@ -536,6 +552,8 @@ TAPTUN_API int TapTun_ReadBatch(
  *
  * Linux GSO may coalesce compatible TCP packets before entering the kernel
  * Linux GSO 可在进入内核前合并兼容的 TCP 数据包
+ * All pointers and packet lengths are checked before any packet is written
+ * 所有指针和包长在写入任何数据包之前检查
  *
  * @param device Device handle
  *               设备句柄
@@ -599,6 +617,8 @@ TAPTUN_API int TapTun_ReleaseReceive(TapTunDevice* device, TapTunPacket* packet)
  *
  * A successful acquisition must be completed by TapTun_CommitSend
  * 成功借用后必须调用 TapTun_CommitSend 完成提交
+ * Shutdown cancels this obligation while retaining the storage until Close
+ * Shutdown 取消此提交义务，并保留存储直到 Close
  *
  * Only one send lease may be active for each device
  * 每个设备只能存在一个发送租约
@@ -639,11 +659,36 @@ TAPTUN_API int TapTun_AcquireSend(
 TAPTUN_API int TapTun_CommitSend(TapTunDevice* device, TapTunPacket* packet);
 
 /**
- * @brief Cancels pending reads and destroys the device
- *        取消等待中的读取并销毁设备
+ * @brief Stops packet I/O and waits for active calls without freeing the device
+ *        停止数据包 I/O 并等待活动调用退出，不释放设备
+ *
+ * Concurrent and repeated Shutdown calls are supported. Later packet I/O
+ * returns CLOSED. This must not be called from a backend callback.
+ * 支持并发及重复调用；后续数据包 I/O 返回 CLOSED。不得在后端回调内调用。
+ * Borrowed packet storage remains valid until released or final Close.
+ * Uncommitted sends cannot be committed after Shutdown.
+ * 借用的包存储保持有效直到释放或最终 Close；Shutdown 后不能提交发送租约。
+ * An error reports failure to drain asynchronous native sends; final Close
+ * is still required after the caller has stopped and joined its workers.
+ * 错误表示异步原生发送未能正常收敛；停止并等待工作线程退出后仍须最终 Close。
+ *
+ * @param device Device handle, must not be NULL
+ *               设备句柄，不得为 NULL
+ * @return TAPTUN_OK on success or a negative TapTunResult on failure
+ *         成功时返回 TAPTUN_OK，失败时返回负数 TapTunResult
+ */
+TAPTUN_API int TapTun_Shutdown(TapTunDevice* device);
+
+/**
+ * @brief Shuts down and destroys the device
+ *        停止并销毁设备
  *
  * Native resources and outstanding leases are released
  * 原生资源和未完成租约会被释放
+ * The caller must ensure no other thread can access the device during or
+ * after Close. For workers: Shutdown, join workers, then Close exactly once.
+ * 调用方必须保证 Close 期间及之后无其他线程访问设备。
+ * 存在工作线程时：Shutdown、等待线程退出、最后仅调用一次 Close。
  *
  * @param device Device handle NULL is accepted
  *               设备句柄 可以传入 NULL

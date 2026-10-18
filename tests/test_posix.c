@@ -1,3 +1,5 @@
+#include <stdatomic.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -10,10 +12,11 @@ typedef struct {
     int written_size;
     int closed;
     int interrupted;
+    atomic_int cancelled;
 } CallbackContext;
 
 static int callback_read(void* context, unsigned char* buffer, int buffer_size) {
-    (void)context;
+    if (atomic_load(&((CallbackContext*)context)->cancelled)) return TAPTUN_ERROR_CLOSED;
     const unsigned char packet[] = { 0x60, 0x00, 0x00, 0x00 };
     if (buffer_size < (int)sizeof(packet)) return TAPTUN_ERROR_BUFFER_TOO_SMALL;
     memcpy(buffer, packet, sizeof(packet));
@@ -21,11 +24,16 @@ static int callback_read(void* context, unsigned char* buffer, int buffer_size) 
 }
 
 static int callback_write(void* context, const unsigned char* data, int data_size) {
+    if (atomic_load(&((CallbackContext*)context)->cancelled)) return TAPTUN_ERROR_CLOSED;
     CallbackContext* callback_context = (CallbackContext*)context;
     if (data_size > (int)sizeof(callback_context->written)) return TAPTUN_ERROR_BUFFER_TOO_SMALL;
     memcpy(callback_context->written, data, (size_t)data_size);
     callback_context->written_size = data_size;
     return data_size;
+}
+
+static void callback_cancel(void* context) {
+    atomic_store(&((CallbackContext*)context)->cancelled, 1);
 }
 
 static void callback_close(void* context) {
@@ -45,6 +53,11 @@ int main(void) {
 
     int sockets[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) != 0) return 1;
+    if (fcntl(sockets[0], F_SETFL, fcntl(sockets[0], F_GETFL) | O_NONBLOCK) < 0) {
+        close(sockets[0]);
+        close(sockets[1]);
+        return 1;
+    }
     TapTunHandleOptions handle_options;
     memset(&handle_options, 0, sizeof(handle_options));
     handle_options.handle = sockets[0];
@@ -75,11 +88,13 @@ int main(void) {
 
     CallbackContext context;
     memset(&context, 0, sizeof(context));
+    atomic_init(&context.cancelled, 0);
     TapTunCallbackOptions options;
     memset(&options, 0, sizeof(options));
     options.context = &context;
     options.read = callback_read;
     options.write = callback_write;
+    options.cancel = callback_cancel;
     options.close = callback_close;
     options.name = "callback-tun";
     device = TapTun_OpenFromCallbacks(&options);
@@ -107,10 +122,12 @@ int main(void) {
     result = result && context.closed && context.written_size == (int)sizeof(packet);
 
     memset(&context, 0, sizeof(context));
+    atomic_init(&context.cancelled, 0);
     memset(&options, 0, sizeof(options));
     options.context = &context;
     options.read = callback_read;
     options.write = callback_write;
+    options.cancel = callback_cancel;
     options.close = callback_close;
     options.interrupt_read = callback_interrupt_read;
     options.name = "callback-tap";
