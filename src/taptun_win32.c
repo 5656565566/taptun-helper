@@ -686,7 +686,27 @@ int TapTun_Activate(TapTunDevice* device) {
         &bytes_returned);
 }
 
-static int delete_addresses(TapTunDevice* device, ADDRESS_FAMILY family) {
+static int address_equals(const SOCKADDR_INET* left, const SOCKADDR_INET* right) {
+    if (left->si_family != right->si_family) return 0;
+    if (left->si_family == AF_INET) {
+        return memcmp(&left->Ipv4.sin_addr, &right->Ipv4.sin_addr,
+            sizeof(left->Ipv4.sin_addr)) == 0;
+    }
+    if (left->si_family == AF_INET6) {
+        return memcmp(&left->Ipv6.sin6_addr, &right->Ipv6.sin6_addr,
+            sizeof(left->Ipv6.sin6_addr)) == 0 &&
+            left->Ipv6.sin6_scope_id == right->Ipv6.sin6_scope_id;
+    }
+    return 0;
+}
+
+/* Deletes the previous unicast addresses of one family on this interface,
+   keeping the address that was just configured. Called only after the new
+   entry exists so a failure can never leave the interface without one. */
+static int delete_replaced_addresses(
+    TapTunDevice* device,
+    ADDRESS_FAMILY family,
+    const SOCKADDR_INET* keep_address) {
     PMIB_UNICASTIPADDRESS_TABLE table = NULL;
     DWORD result = GetUnicastIpAddressTable(family, &table);
     if (result != NO_ERROR) {
@@ -698,6 +718,9 @@ static int delete_addresses(TapTunDevice* device, ADDRESS_FAMILY family) {
     for (ULONG i = 0; i < table->NumEntries; ++i) {
         MIB_UNICASTIPADDRESS_ROW* row = &table->Table[i];
         if (row->InterfaceLuid.Value != device->luid.Value) continue;
+        if (keep_address && address_equals(&row->Address, keep_address)) {
+            continue;
+        }
         result = DeleteUnicastIpAddressEntry(row);
         if (result != NO_ERROR && result != ERROR_NOT_FOUND) {
             SetLastError(result);
@@ -707,6 +730,19 @@ static int delete_addresses(TapTunDevice* device, ADDRESS_FAMILY family) {
     }
     FreeMibTable(table);
     return status;
+}
+
+static DWORD create_or_update_address(MIB_UNICASTIPADDRESS_ROW* row) {
+    DWORD result = CreateUnicastIpAddressEntry(row);
+    if (result != ERROR_OBJECT_ALREADY_EXISTS) return result;
+
+    // Read the existing entry before changing its prefix so unrelated address
+    // properties are preserved.
+    UINT8 prefix_length = row->OnLinkPrefixLength;
+    result = GetUnicastIpAddressEntry(row);
+    if (result != NO_ERROR || row->OnLinkPrefixLength == prefix_length) return result;
+    row->OnLinkPrefixLength = prefix_length;
+    return SetUnicastIpAddressEntry(row);
 }
 
 int TapTun_SetIPAddressV4(TapTunDevice* device, const char* address, unsigned int prefix_length) {
@@ -723,11 +759,13 @@ int TapTun_SetIPAddressV4(TapTunDevice* device, const char* address, unsigned in
     if (InetPtonA(AF_INET, address, &row.Address.Ipv4.sin_addr) != 1) {
         return TAPTUN_ERROR_INVALID_ARGUMENT;
     }
-    if (delete_addresses(device, AF_INET) != TAPTUN_OK) return TAPTUN_ERROR;
-    DWORD result = CreateUnicastIpAddressEntry(&row);
-    if (result == NO_ERROR || result == ERROR_OBJECT_ALREADY_EXISTS) return TAPTUN_OK;
-    SetLastError(result);
-    return TAPTUN_ERROR;
+    // Configure the requested address before removing previous addresses.
+    DWORD result = create_or_update_address(&row);
+    if (result != NO_ERROR) {
+        SetLastError(result);
+        return TAPTUN_ERROR;
+    }
+    return delete_replaced_addresses(device, AF_INET, &row.Address);
 }
 
 int TapTun_SetIPAddressV6(TapTunDevice* device, const char* address, unsigned int prefix_length) {
@@ -744,11 +782,13 @@ int TapTun_SetIPAddressV6(TapTunDevice* device, const char* address, unsigned in
     if (InetPtonA(AF_INET6, address, &row.Address.Ipv6.sin6_addr) != 1) {
         return TAPTUN_ERROR_INVALID_ARGUMENT;
     }
-    if (delete_addresses(device, AF_INET6) != TAPTUN_OK) return TAPTUN_ERROR;
-    DWORD result = CreateUnicastIpAddressEntry(&row);
-    if (result == NO_ERROR || result == ERROR_OBJECT_ALREADY_EXISTS) return TAPTUN_OK;
-    SetLastError(result);
-    return TAPTUN_ERROR;
+    // Configure the requested address before removing previous addresses.
+    DWORD result = create_or_update_address(&row);
+    if (result != NO_ERROR) {
+        SetLastError(result);
+        return TAPTUN_ERROR;
+    }
+    return delete_replaced_addresses(device, AF_INET6, &row.Address);
 }
 
 static int dequeue_synthetic_frame(

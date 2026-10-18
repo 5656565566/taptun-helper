@@ -38,6 +38,7 @@ ifeq ($(TARGET),windows)
 	LDFLAGS_PLATFORM = -shared -liphlpapi -lws2_32 -ladvapi32 -Wl,--out-implib,$(TARGET_IMPLIB)
 	TEST_EXE = bin/test_windows.exe
 	TEST_SRC = tests/test_windows.c
+	WINDOWS_IP_TEST_EXE = bin/test_windows_ip.exe
 	BENCHMARK_EXE = bin/benchmark_windows.exe
 	BENCHMARK_SRC = benchmarks/benchmark_windows.c
 	TEST_LDFLAGS_PLATFORM = -municode
@@ -88,6 +89,7 @@ GENERATED_BINARIES = \
 	bin/libtaptun.so \
 	bin/libtaptun.dylib \
 	bin/test_windows.exe \
+	bin/test_windows_ip.exe \
 	bin/test_linux \
 	bin/test_posix \
 	bin/test_macos \
@@ -112,7 +114,7 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	@echo "==> Compiling $< for $(TARGET) ($(BUILD))..."
 	$(CC) $(CFLAGS) -DTUNTAP_EXPORTS -c $< -o $@
 
-test: $(TEST_EXE) $(PROTOCOL_TEST_EXE) $(OFFLOAD_TEST_EXE)
+test: $(TEST_EXE) $(PROTOCOL_TEST_EXE) $(OFFLOAD_TEST_EXE) $(WINDOWS_IP_TEST_EXE)
 
 $(TEST_EXE): $(TARGET_LIB) $(TEST_SRC) FORCE
 	@echo "==> Linking test executable for $(TARGET)..."
@@ -124,6 +126,13 @@ $(PROTOCOL_TEST_EXE): $(COMMON_SRC) tests/test_tun2tap.c FORCE
 	@echo "==> Linking tun2tap protocol test..."
 	$(CC) $(CFLAGS) $(COMMON_SRC) tests/test_tun2tap.c -o $@
 	@echo "==> Successfully created $@"
+
+ifneq ($(WINDOWS_IP_TEST_EXE),)
+$(WINDOWS_IP_TEST_EXE): $(SRC_DIR)/taptun_win32.c $(COMMON_SRC) tests/test_windows_ip.c FORCE
+	@mkdir -p bin
+	@echo "==> Linking Windows IP configuration test..."
+	$(CC) $(CFLAGS) -DTUNTAP_EXPORTS $(COMMON_SRC) tests/test_windows_ip.c -o $@ -liphlpapi -lws2_32 -ladvapi32
+endif
 
 ifneq ($(OFFLOAD_TEST_EXE),)
 $(OFFLOAD_TEST_EXE): $(SRC_DIR)/linux_offload.c tests/test_linux_offload.c FORCE
