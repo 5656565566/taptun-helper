@@ -79,6 +79,7 @@ static void end_read_operation(TapTunDevice* device) {
 
 TapTunDevice* TapTun_Open(const TapTunOptions* options) {
     (void)options;
+    errno = ENOTSUP;
     return NULL;
 }
 

@@ -163,7 +163,12 @@ static TapTunDevice* allocate_device(
 }
 
 TapTunDevice* TapTun_Open(const TapTunOptions* options) {
-    if (options && options->open_mode == TAPTUN_OPEN_EXISTING_ONLY) return NULL;
+    if (options && options->open_mode == TAPTUN_OPEN_EXISTING_ONLY) {
+        // utun devices cannot be attached by name; the control socket always
+        // creates a new unit.
+        errno = ENOTSUP;
+        return NULL;
+    }
     TapTunMode mode = options ? options->mode : TAPTUN_MODE_TUN;
     TapTunTapBackend tap_backend = options ? options->tap_backend : TAPTUN_TAP_BACKEND_AUTO;
     if ((mode != TAPTUN_MODE_TUN && mode != TAPTUN_MODE_TAP) ||

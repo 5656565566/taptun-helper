@@ -381,8 +381,20 @@ TapTunDevice* TapTun_OpenWithPerformance(
     unsigned int existing_index = requested_name && requested_name[0] != '\0'
         ? if_nametoindex(requested_name)
         : 0;
-    if (options && options->open_mode == TAPTUN_OPEN_EXISTING_ONLY && existing_index == 0) return NULL;
-    if (options && options->open_mode == TAPTUN_OPEN_CREATE_ONLY && existing_index != 0) return NULL;
+    if (options && options->open_mode == TAPTUN_OPEN_EXISTING_ONLY) {
+        if (!requested_name || requested_name[0] == '\0') {
+            errno = EINVAL;
+            return NULL;
+        }
+        if (existing_index == 0) {
+            errno = ENODEV;
+            return NULL;
+        }
+    }
+    if (options && options->open_mode == TAPTUN_OPEN_CREATE_ONLY && existing_index != 0) {
+        errno = EEXIST;
+        return NULL;
+    }
 
     TapTunMode mode = options ? options->mode : TAPTUN_MODE_TUN;
     TapTunTapBackend tap_backend = options ? options->tap_backend : TAPTUN_TAP_BACKEND_AUTO;
